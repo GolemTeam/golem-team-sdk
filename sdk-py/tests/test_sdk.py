@@ -256,3 +256,67 @@ class TestSDKLabelsParameter:
             labels={"branch": "main", "env": 42},  # type: ignore
         )
         assert sdk._labels == {"branch": "main"}
+
+
+class _Opaque:
+    def __str__(self):
+        return "opaque"
+
+
+def _signed_args(sdk, args):
+    result = sdk.intercept_execution(**{**SAMPLE_ARGS, "tool_arguments": args})
+    return cbor2.loads(result["cbor_payload"])["tool_arguments"]
+
+
+class TestArgumentBounds:
+    """Arguments are cut down to size and to what CBOR encodes, never dropped."""
+
+    def test_unencodable_values_are_recorded_as_text(self, witness_sdk):
+        args = {"obj": _Opaque(), "raw": b"\x00\x01", "tags": {"x"}, "pair": (1, 2), 3: "int-key"}
+        assert _signed_args(witness_sdk, args) == {
+            "obj": "opaque", "raw": "b'\\x00\\x01'", "tags": ["x"], "pair": [1, 2], "3": "int-key",
+        }
+
+    def test_more_than_100_keys_keeps_99_and_counts_the_rest(self, witness_sdk):
+        args = {f"k{i:03d}": i for i in range(150)}
+        signed = _signed_args(witness_sdk, args)
+        assert len(signed) == 100
+        assert signed["_golem_truncated_keys"] == 51
+        assert signed["k000"] == 0 and signed["k098"] == 98 and "k099" not in signed
+
+    def test_exactly_100_keys_is_untouched(self, witness_sdk):
+        args = {f"k{i}": i for i in range(100)}
+        assert _signed_args(witness_sdk, args) == args
+
+    def test_a_long_string_is_cut_at_64_kb(self, witness_sdk):
+        signed = _signed_args(witness_sdk, {"content": "a" * 100_000})
+        assert signed["content"] == "a" * 65536 + "...[truncated]"
+
+    def test_all_strings_together_are_bounded(self, witness_sdk):
+        signed = _signed_args(witness_sdk, {f"f{i}": "b" * 60_000 for i in range(40)})
+        assert len(signed) == 40
+        assert sum(len(v) for v in signed.values()) < 1024 * 1024 + 40 * len("...[truncated]")
+        assert signed["f39"] == "...[truncated]"
+
+    def test_nesting_is_bounded(self, witness_sdk):
+        deep = {}
+        node = deep
+        for _ in range(50):
+            node["child"] = {}
+            node = node["child"]
+        signed = _signed_args(witness_sdk, {"tree": deep, "items": list(range(5000))})
+        assert len(signed["items"]) == 1001
+        assert signed["items"][-1] == "...[4000 more items]"
+        depth, node = 0, signed["tree"]
+        while isinstance(node, dict):
+            node, depth = node.get("child"), depth + 1
+        assert depth <= 16
+
+    def test_the_callers_arguments_are_not_changed(self, witness_sdk):
+        args = {"content": "a" * 100_000, "obj": _Opaque()}
+        _signed_args(witness_sdk, args)
+        assert len(args["content"]) == 100_000 and isinstance(args["obj"], _Opaque)
+
+    def test_legacy_mode_stores_unencodable_arguments(self, sdk):
+        result = sdk.intercept_execution(**{**SAMPLE_ARGS, "tool_arguments": {"obj": _Opaque()}})
+        assert result["storage_uri"].startswith("file://")

@@ -224,3 +224,45 @@ def test_semantic_kernel_continues_when_allowed():
     f = GolemFunctionInvocationFilter(sdk=FakeSDK(), agent_id="a1", enforce=True)
     asyncio.run(f(Ctx(), next_stage))
     assert len(continued) == 1
+
+
+def test_a_refusal_is_recorded_under_the_sdks_own_session():
+    # The check sent an empty session and host, so a refusal landed in the
+    # agent's per-host fallback session instead of the run it stopped.
+    from golem_sdk import GolemSDK
+
+    url, srv, seen = _serve({"action": "block", "rule_name": "r", "reason": "no"})
+    try:
+        sdk = GolemSDK(witness_url=url, session_id="run-42", host_id="ci-runner")
+        sdk.check_execution(tool_name="Bash", command="rm -rf /", agent_id="a")
+    finally:
+        srv.shutdown()
+    assert seen["body"]["session_id"] == "run-42"
+    assert seen["body"]["host_id"] == "ci-runner"
+
+
+def test_the_check_carries_the_arguments_and_server_rules_match_on():
+    # The check sent only a tool name and a command, so argument rules and
+    # inventory decisions had nothing to match an SDK call against.
+    url, srv, seen = _serve({"action": "block", "rule_name": "no-deletes", "reason": "no"})
+    try:
+        d = WitnessClient(witness_url=url).check_execution(
+            tool_name="drop_table", agent_id="a", session_id="s",
+            tool_arguments={"table": "users"}, mcp_server_id="langchain")
+    finally:
+        srv.shutdown()
+    assert seen["body"]["tool_arguments"] == {"table": "users"}
+    assert seen["body"]["mcp_server_id"] == "langchain"
+    assert seen["body"]["event_type"] == "sdk_tool_call"
+    assert d.allowed is False and d.rule_name == "no-deletes"
+
+
+def test_an_argument_json_cannot_encode_does_not_raise_into_the_call():
+    url, srv, seen = _serve({"action": "allow"})
+    try:
+        d = WitnessClient(witness_url=url).check_execution(
+            tool_name="t", tool_arguments={"when": object()}, mcp_server_id="x")
+    finally:
+        srv.shutdown()
+    assert d.allowed is True and d.reachable is True
+    assert isinstance(seen["body"]["tool_arguments"]["when"], str)

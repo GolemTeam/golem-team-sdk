@@ -1,49 +1,59 @@
 """LangChain integration for the Golem SDK.
 
-Drop-in callback handler that captures every tool invocation a
-LangChain agent makes — including those nested inside LCEL chains and
-``AgentExecutor`` runs — and routes the pre-execution state through
-``GolemSDK.intercept_execution``.
+Two entry points, for the two ways LangChain runs a tool:
+
+* ``GolemToolMiddleware`` for an agent built with ``langchain.agents.create_agent``.
+  It records each tool call before it runs and its result after, and each model
+  call's token usage. With ``enforce=True`` it answers a refused call with a
+  ``ToolMessage`` carrying the reason, so the model reads the refusal and the
+  run carries on. A result the Golem agent withholds reaches the model as the
+  agent's notice instead.
+* ``GolemCallbackHandler`` for tools and chains run directly (``tool.invoke``,
+  LCEL). It records each call before it runs, its result after, and each model
+  call's token usage. With ``enforce=True`` it raises ``GolemPolicyBlocked``
+  before the tool body runs. Inside an agent loop that exception ends the run
+  unless the ``ToolNode`` was built with ``handle_tool_errors`` covering it,
+  which is why agents should use the middleware. A callback cannot change a
+  tool's output, so the handler records a withheld result but cannot keep it
+  from the model.
+
+Use one or the other for a given run: attached together they record each call
+twice.
 
 Usage:
 
     from golem_sdk import GolemSDK
-    from golem_sdk.integrations.langchain import GolemCallbackHandler
-
-    sdk = GolemSDK(
-        witness_url="http://localhost:39393",
-        labels={"workspace": "alice-laptop", "env": "dev"},
+    from golem_sdk.integrations.langchain import (
+        GolemCallbackHandler, GolemToolMiddleware,
     )
-    handler = GolemCallbackHandler(sdk, agent_id="my-agent",
-                                   mcp_server_id="langchain")
 
-    # Pass to a chain or agent:
+    sdk = GolemSDK(witness_url="http://localhost:39393")
+
+    agent = create_agent(model, tools, middleware=[
+        GolemToolMiddleware(sdk, agent_id="my-agent", enforce=True),
+    ])
+
+    handler = GolemCallbackHandler(sdk, agent_id="my-agent", enforce=True)
     chain.invoke({"input": "hello"}, config={"callbacks": [handler]})
 
-    # Or set globally:
-    from langchain.callbacks import set_handler
-    set_handler(handler)
-
-This module is **import-only** when ``langchain-core`` is installed.
-We don't pin a hard version range — LangChain's callback surface has
-been stable since v0.1; the ``BaseCallbackHandler`` interface points
-we depend on (``on_tool_start`` / ``on_tool_end`` / ``on_tool_error``)
-have been there since the public API stabilised. We log a warning at
-construction time if a known-breaking newer schema is detected so
-the failure mode is loud rather than silent.
+The handler needs ``langchain-core``; the middleware also needs ``langchain``
+1.0 or later.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from uuid import UUID
 
-from golem_sdk.policy import GolemPolicyBlocked
+from golem_sdk.integrations._calls import ToolCall
+from golem_sdk.policy import GolemPolicyBlocked, blocked_message
 
 try:  # pragma: no cover — covered by tests that import this module
     from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.messages import AIMessage, ToolMessage
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "golem_sdk.integrations.langchain requires the langchain-core "
@@ -51,35 +61,26 @@ except ImportError as exc:  # pragma: no cover
         "pip install langchain-core."
     ) from exc
 
+try:
+    from langchain.agents.middleware import AgentMiddleware as _AgentMiddleware
+except ImportError:
+    _AgentMiddleware = object  # type: ignore[assignment,misc]
+
 from golem_sdk import GolemSDK
 
 logger = logging.getLogger("golem_sdk.integrations.langchain")
 
+_MAX_OPEN_CALLS = 1024
+
 
 class GolemCallbackHandler(BaseCallbackHandler):
-    """LangChain callback that forwards tool invocations to Golem.
+    """LangChain callback that records tool calls, their results and model usage
+    to Golem, and can refuse a call.
 
-    Hooks into the standard ``BaseCallbackHandler`` lifecycle so it
-    works inside ``AgentExecutor``, LCEL pipelines, and standalone
-    ``Tool.invoke`` paths. The handler is non-blocking — every Golem
-    call goes through ``GolemSDK.intercept_execution`` which is itself
-    fire-and-forget in witness mode, so a slow Golem stack never
-    slows down the user's agent.
-
-    Errors raised by the Golem SDK (validation, network, etc.) are
-    caught and logged at WARN; a bad telemetry call MUST NEVER break
-    the user's chain.
+    Errors raised by the Golem SDK (validation, network, etc.) are caught and
+    logged at WARN; a bad telemetry call never breaks the user's chain.
     """
 
-    # LangChain ``raise_error`` knob: when False (default) the handler
-    # swallows its own exceptions instead of propagating them out of
-    # the callback dispatch. We always want the swallow behaviour
-    # because a Golem telemetry failure shouldn't break a customer's
-    # agent run.
-    raise_error: bool = False
-
-    # Run lightweight when callbacks are emitted by a non-LLM/tool
-    # node — saves a no-op intercept_execution per chain step.
     run_inline: bool = True
 
     def __init__(
@@ -89,6 +90,7 @@ class GolemCallbackHandler(BaseCallbackHandler):
         mcp_server_id: str = "langchain",
         capture_llm_calls: bool = False,
         enforce: bool = False,
+        record_usage: bool = True,
     ) -> None:
         """Wire a Golem SDK instance to receive LangChain callbacks.
 
@@ -96,27 +98,19 @@ class GolemCallbackHandler(BaseCallbackHandler):
             sdk: A ``GolemSDK`` instance, ideally in witness mode
                 (``GolemSDK(witness_url=...)``).
             agent_id: Identifier for the agent that owns this handler.
-                Surfaces in the Golem console as the agent column.
-                Free-form but should be stable per deployment so
-                queries by ``agent_id`` work.
-            mcp_server_id: Identifier for the conceptual "MCP server"
-                this run targets. Defaults to ``"langchain"`` — set
-                explicitly when the agent talks to a specific named
-                LangChain toolkit you want to slice on.
-            enforce: If True, consult the witness BEFORE each tool runs
-                and raise ``GolemPolicyBlocked`` when policy refuses it,
-                which aborts the chain. Off by default: turning it on
-                changes a monitored agent into a gated one, and a new
-                default that can stop a customer's tool call is not a
-                default. With it off this handler only records, exactly
-                as before.
-            capture_llm_calls: If True, also emit a Golem event for
-                each LLM round-trip (``on_llm_start``). Off by
-                default because most deployments capture LLM traffic
-                via the Anthropic / OpenAI HTTP proxies; double-
-                capture would inflate the chain count. Turn on for
-                pure-SDK deployments where the LLM API proxy isn't
-                in the path.
+            mcp_server_id: The server the call is judged and recorded under.
+                Defaults to ``"langchain"``.
+            enforce: If True, consult the Golem agent BEFORE each tool runs and
+                raise ``GolemPolicyBlocked`` when policy refuses it. Off by
+                default: turning it on changes a monitored agent into a gated
+                one.
+            capture_llm_calls: If True, also emit a Golem event for each LLM
+                round-trip (``on_llm_start``). Off by default because most
+                deployments capture LLM traffic via the Golem agent's HTTP
+                proxies.
+            record_usage: Record each model call's token counts, as the model
+                reported them. Turn off when the model traffic already goes
+                through the Golem agent's proxies, which count it there.
         """
         super().__init__()
         self._sdk = sdk
@@ -124,14 +118,11 @@ class GolemCallbackHandler(BaseCallbackHandler):
         self._mcp_server_id = mcp_server_id
         self._capture_llm_calls = capture_llm_calls
         self._enforce = enforce
-        # tool_start → tool_end pairing for duration reporting.
-        # Bounded so a runaway agent doesn't accumulate forever.
-        self._run_starts: Dict[UUID, float] = {}
-        self._MAX_RUN_STARTS = 1024
-
-    # ------------------------------------------------------------------
-    # Tool lifecycle
-    # ------------------------------------------------------------------
+        self._record_usage = record_usage
+        # LangChain's callback manager logs and swallows a handler's exception
+        # unless raise_error is set, and a swallowed refusal lets the tool run.
+        self.raise_error = enforce
+        self._calls: Dict[UUID, ToolCall] = {}
 
     def on_tool_start(
         self,
@@ -145,42 +136,22 @@ class GolemCallbackHandler(BaseCallbackHandler):
         inputs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
-        """Fired when a LangChain Tool is about to execute.
+        call = ToolCall(
+            self._sdk, self._agent_id, self._mcp_server_id, _safe_tool_name(serialized),
+            inputs if isinstance(inputs, dict) else _input_str_to_args(input_str),
+            call_id=kwargs.get("tool_call_id"),
+        )
 
-        Records the call to Golem BEFORE the tool runs so the
-        signed audit trail represents *intent*, not just outcome —
-        matches Golem's PreToolUse semantics elsewhere in the stack.
-        """
-        tool_name = _safe_tool_name(serialized)
-
-        # The refusal is raised OUTSIDE the try below, and that placement is the
-        # whole feature. The handler swallows every exception so a Golem fault
-        # never breaks a customer's chain; a policy block is not a fault, and
-        # letting it fall into that except would enforce nothing while looking
-        # like it did.
+        # Raised outside any except: a Golem fault never breaks the chain, and
+        # a policy refusal is not a fault.
         if self._enforce:
-            decision = self._sdk.check_execution(
-                tool_name=tool_name,
-                command=input_str or "",
-                agent_id=self._agent_id,
-            )
+            decision = call.check()
             if not decision.allowed:
-                raise GolemPolicyBlocked(tool_name, decision.reason)
+                raise GolemPolicyBlocked(call.tool_name, decision.reason)
 
-        try:
-            args = inputs if inputs is not None else _input_str_to_args(input_str)
-            self._sdk.intercept_execution(
-                agent_id=self._agent_id,
-                mcp_server_id=self._mcp_server_id,
-                tool_name=tool_name,
-                tool_arguments=args,
-            )
-            # Track start so on_tool_end can report duration via
-            # metadata if a future SDK version supports it.
-            if len(self._run_starts) < self._MAX_RUN_STARTS:
-                self._run_starts[run_id] = time.monotonic()
-        except Exception as e:  # noqa: BLE001 — never break the chain
-            logger.warning("golem on_tool_start failed: %s", type(e).__name__)
+        call.record()
+        if len(self._calls) < _MAX_OPEN_CALLS:
+            self._calls[run_id] = call
 
     def on_tool_end(
         self,
@@ -190,8 +161,9 @@ class GolemCallbackHandler(BaseCallbackHandler):
         parent_run_id: Optional[UUID] = None,
         **kwargs: Any,
     ) -> None:
-        """Tool completed cleanly. Clears the run-start bookkeeping."""
-        self._run_starts.pop(run_id, None)
+        call = self._calls.pop(run_id, None)
+        if call is not None:
+            call.finish(_tool_output(output), is_error=getattr(output, "status", "") == "error")
 
     def on_tool_error(
         self,
@@ -201,14 +173,9 @@ class GolemCallbackHandler(BaseCallbackHandler):
         parent_run_id: Optional[UUID] = None,
         **kwargs: Any,
     ) -> None:
-        """Tool errored. Same — clear bookkeeping. (Tool error capture
-        through Golem is left to a future commit; today PreToolUse
-        records intent, not outcome.)"""
-        self._run_starts.pop(run_id, None)
-
-    # ------------------------------------------------------------------
-    # LLM lifecycle (opt-in)
-    # ------------------------------------------------------------------
+        call = self._calls.pop(run_id, None)
+        if call is not None:
+            call.finish(f"{type(error).__name__}: {error}", is_error=True)
 
     def on_llm_start(
         self,
@@ -220,13 +187,10 @@ class GolemCallbackHandler(BaseCallbackHandler):
         invocation_params: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
-        """Optional: record the LLM call as a Golem event."""
         if not self._capture_llm_calls:
             return
         try:
             llm_name = _safe_tool_name(serialized, default="llm.call")
-            # LangChain serialises prompts as a list; join with a
-            # marker so multi-prompt batches stay distinguishable.
             prompt_text = "\n---\n".join(prompts) if isinstance(prompts, list) else str(prompts)
             self._sdk.intercept_execution(
                 agent_id=self._agent_id,
@@ -238,18 +202,136 @@ class GolemCallbackHandler(BaseCallbackHandler):
         except Exception as e:  # noqa: BLE001
             logger.warning("golem on_llm_start failed: %s", type(e).__name__)
 
+    def on_llm_end(self, response: Any, *, run_id: UUID, **kwargs: Any) -> None:
+        if not self._record_usage:
+            return
+        llm_output = getattr(response, "llm_output", None) or {}
+        for generations in getattr(response, "generations", None) or []:
+            for generation in generations:
+                message = getattr(generation, "message", None)
+                if message is not None:
+                    _record_usage(self._sdk, self._agent_id, message, llm_output)
 
-# ----------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------
+
+class GolemToolMiddleware(_AgentMiddleware):  # type: ignore[misc,valid-type]
+    """``create_agent`` middleware that records each tool call before it runs,
+    its result after, and each model call's token usage.
+
+    With ``enforce=True`` a refused call is not run: the model receives a
+    ``ToolMessage`` with status ``error`` and the content
+    ``"Blocked by Golem policy: <reason>"``, and the agent loop continues. A
+    result the Golem agent withholds reaches the model as its notice.
+    """
+
+    def __init__(
+        self,
+        sdk: GolemSDK,
+        agent_id: str,
+        mcp_server_id: str = "langchain",
+        enforce: bool = False,
+        record_usage: bool = True,
+    ) -> None:
+        if _AgentMiddleware is object:
+            raise ImportError(
+                "GolemToolMiddleware requires langchain 1.0 or later "
+                "(pip install langchain)."
+            )
+        super().__init__()
+        self._sdk = sdk
+        self._agent_id = agent_id
+        self._mcp_server_id = mcp_server_id
+        self._enforce = enforce
+        self._record_usage = record_usage
+
+    def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        call, refusal = self._start(request.tool_call)
+        if refusal is not None:
+            return refusal
+        try:
+            response = handler(request)
+        except Exception as e:
+            call.finish(f"{type(e).__name__}: {e}", is_error=True)
+            raise
+        return self._finish(call, response)
+
+    async def awrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        call, refusal = await asyncio.to_thread(self._start, request.tool_call)
+        if refusal is not None:
+            return refusal
+        try:
+            response = await handler(request)
+        except Exception as e:
+            await asyncio.to_thread(call.finish, f"{type(e).__name__}: {e}", True)
+            raise
+        return await asyncio.to_thread(self._finish, call, response)
+
+    def after_model(self, state: Any, runtime: Any) -> None:
+        if not self._record_usage:
+            return None
+        messages = state.get("messages") if isinstance(state, dict) else getattr(state, "messages", None)
+        if messages and isinstance(messages[-1], AIMessage):
+            _record_usage(self._sdk, self._agent_id, messages[-1], {})
+        return None
+
+    def _start(self, tool_call: Dict[str, Any]) -> tuple:
+        args = tool_call.get("args")
+        call = ToolCall(
+            self._sdk, self._agent_id, self._mcp_server_id, tool_call.get("name") or "unknown",
+            args if isinstance(args, dict) else {"input": args},
+            call_id=tool_call.get("id"),
+        )
+        if self._enforce:
+            decision = call.check()
+            if not decision.allowed:
+                return call, ToolMessage(
+                    content=blocked_message(decision.reason),
+                    name=call.tool_name,
+                    tool_call_id=tool_call.get("id") or "",
+                    status="error",
+                )
+        call.record()
+        return call, None
+
+    def _finish(self, call: ToolCall, response: Any) -> Any:
+        if not isinstance(response, ToolMessage):
+            return response
+        notice = call.finish(_tool_output(response), is_error=response.status == "error")
+        if notice is None:
+            return response
+        return ToolMessage(content=notice, name=response.name,
+                           tool_call_id=response.tool_call_id, status=response.status)
+
+
+def _tool_output(output: Any) -> Any:
+    return output.content if isinstance(output, ToolMessage) else output
+
+
+def _record_usage(sdk: GolemSDK, agent_id: str, message: Any, llm_output: Dict[str, Any]) -> None:
+    usage = getattr(message, "usage_metadata", None)
+    if not usage:
+        return
+    meta = getattr(message, "response_metadata", None) or {}
+    model = (meta.get("model_name") or meta.get("model")
+             or llm_output.get("model_name") or llm_output.get("model"))
+    if not model:
+        return
+    details = usage.get("input_token_details") or {}
+    try:
+        sdk.record_usage(
+            str(model),
+            input_tokens=usage.get("input_tokens") or 0,
+            output_tokens=usage.get("output_tokens") or 0,
+            cache_read_tokens=details.get("cache_read") or 0,
+            cache_creation_tokens=details.get("cache_creation") or 0,
+            provider=str(meta.get("model_provider") or ""),
+            agent_id=agent_id,
+        )
+    except Exception as e:  # noqa: BLE001 — never break the agent
+        logger.warning("golem: recording model usage failed: %s", type(e).__name__)
 
 
 def _safe_tool_name(serialized: Dict[str, Any], default: str = "unknown") -> str:
-    """LangChain serializes the tool's class/registration info in
-    ``serialized``. The ``name`` key is the canonical place but older
-    LangChain releases put it under ``id`` as a class path. Fall back
-    gracefully so a renamed internal layout doesn't break capture.
-    """
+    """The tool's ``name``, else the last part of its ``id`` class path."""
     if not isinstance(serialized, dict):
         return default
     name = serialized.get("name")
@@ -263,12 +345,12 @@ def _safe_tool_name(serialized: Dict[str, Any], default: str = "unknown") -> str
     return default
 
 
-def _input_str_to_args(input_str: str) -> Dict[str, Any]:
-    """LangChain's older API passed a raw input string; newer versions
-    pass a structured ``inputs`` dict. Normalise to a dict so the
-    downstream SDK's ``tool_arguments`` (which requires a dict)
-    accepts the value either way.
-    """
+def _input_str_to_args(input_str: Any) -> Dict[str, Any]:
+    """Arguments from the raw input string, when LangChain passes no ``inputs``."""
     if not isinstance(input_str, str):
         return {"input": str(input_str)}
-    return {"input": input_str}
+    try:
+        decoded = json.loads(input_str)
+    except ValueError:
+        return {"input": input_str}
+    return decoded if isinstance(decoded, dict) else {"input": input_str}

@@ -27,7 +27,11 @@ npm run build
 
 The recommended setup sends events to the Golem agent: `new GolemSDK({ witnessUrl: 'http://localhost:39393' })`
 signs with COSE_Sign1 and POSTs a protobuf `LedgerEntry` to the local Golem agent,
-which owns BYOB storage. The example below is the deprecated legacy mode, in which
+which owns BYOB storage. The agent checks that signature, then signs the ledger entry
+with the machine's key: the entry's `payload_hash` is the SDK's `bom_hash`, the signed
+bytes go to your storage, and the SDK's own signature stays on the entry as
+`sdk_cose_sign1`. Every call from one `GolemSDK` is recorded under one session
+(`sdk.session`); pass `sessionId` to group a run under an id of your own. The example below is the deprecated legacy mode, in which
 the SDK stores the payload itself:
 
 ```typescript
@@ -53,6 +57,36 @@ console.log(result.bomHash);     // SHA-256 hex (64 chars)
 console.log(result.storageUri);  // s3://my-bucket/boms/<hash>.json
 console.log(result.coseSign1);   // COSE_Sign1 envelope, ES256 (Buffer)
 ```
+
+## Before, after, and around a call
+
+With the Golem agent (`witnessUrl`), an app can ask before a call, and record the
+result and each model call's usage after:
+
+```typescript
+const sdk = new GolemSDK({ witnessUrl: 'http://localhost:39393' });
+
+const args = { id: 'OPS-12' };
+const decision = await sdk.checkExecution({ toolName: 'get_ticket', mcpServerId: 'jira', toolArguments: args });
+if (!decision.allowed) throw new Error(`Blocked by Golem policy: ${decision.reason}`);
+
+const call = await sdk.interceptExecution({ agent_id: 'support-bot', mcp_server_id: 'jira', tool_name: 'get_ticket', tool_arguments: args });
+const output = await getTicket(args.id);
+const verdict = await sdk.recordResult({ toolName: 'get_ticket', result: output, toolUseId: call.toolUseId, mcpServerId: 'jira' });
+const reply = verdict.action === 'withhold' ? verdict.notice : output; // what the model reads
+
+sdk.recordUsage({ model: 'claude-sonnet-5-5', inputTokens: 1200, outputTokens: 85, provider: 'anthropic' });
+```
+
+- `checkExecution` answers `allowed: false` only on a block or deny. It fails open: an
+  unreachable agent answers allowed, with `reachable: false`.
+- `recordResult` pairs the result with its call on `toolUseId`. The Golem agent
+  checks the result for prompt injection as `mcp__<mcpServerId>__<toolName>`. When a
+  rule blocks on that check, the action is `withhold` and `notice` is the text to
+  give the model instead. When a rule advises, `advice` goes alongside the result. It
+  also fails open.
+- `recordUsage` sends one model call's tokens without waiting. Golem does not
+  price a model an SDK names.
 
 ## Redaction before signing
 

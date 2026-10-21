@@ -72,9 +72,9 @@ def test_on_tool_end_clears_run_tracking(mock_sdk):
     handler.on_tool_start(
         serialized={"name": "tool"}, input_str="", run_id=run_id
     )
-    assert run_id in handler._run_starts
+    assert run_id in handler._calls
     handler.on_tool_end(output="result", run_id=run_id)
-    assert run_id not in handler._run_starts
+    assert run_id not in handler._calls
 
 
 def test_on_tool_error_clears_run_tracking(mock_sdk):
@@ -84,7 +84,7 @@ def test_on_tool_error_clears_run_tracking(mock_sdk):
         serialized={"name": "tool"}, input_str="", run_id=run_id
     )
     handler.on_tool_error(error=RuntimeError("boom"), run_id=run_id)
-    assert run_id not in handler._run_starts
+    assert run_id not in handler._calls
 
 
 def test_capture_llm_calls_off_by_default(mock_sdk):
@@ -112,15 +112,17 @@ def test_capture_llm_calls_on_when_enabled(mock_sdk):
     assert call.kwargs["system_prompt"] == "What is 2 + 2?"
 
 
-def test_run_starts_bounded(mock_sdk):
-    """A runaway agent shouldn't accumulate run-start entries forever."""
+def test_open_calls_bounded(mock_sdk, monkeypatch):
+    """A runaway agent shouldn't accumulate unfinished calls forever."""
+    from golem_sdk.integrations import langchain
+
+    monkeypatch.setattr(langchain, "_MAX_OPEN_CALLS", 5)
     handler = GolemCallbackHandler(mock_sdk, agent_id="agent-A")
-    handler._MAX_RUN_STARTS = 5  # tighten for the test
     for _ in range(20):
         handler.on_tool_start(
             serialized={"name": "tool"}, input_str="", run_id=uuid4()
         )
-    assert len(handler._run_starts) <= 5
+    assert len(handler._calls) <= 5
 
 
 def test_safe_tool_name_prefers_name_key():

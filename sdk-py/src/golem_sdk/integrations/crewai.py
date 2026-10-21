@@ -1,54 +1,171 @@
 """CrewAI integration for the Golem SDK.
 
-CrewAI's observability surface is a pair of callable hooks on
-``Crew`` (and per-``Agent``): ``step_callback`` fires after each
-agent step, ``task_callback`` fires when a task completes. Both
-accept a plain callable; there is no ABC to subclass, which is
-why this module has **no hard dependency on ``crewai``**. We
-produce callables that match the documented signatures.
+``GolemToolHooks`` registers CrewAI's global before/after tool-call hooks
+(``crewai.hooks``). The before hook sees the tool name and its arguments before
+the tool runs, on both of CrewAI's tool-calling paths (native function calling
+and the ReAct text protocol). It records the call and, with ``enforce=True``,
+blocks a call your policy refuses: the tool does not run and the model reads
+``"Blocked by Golem policy: <reason>"`` as the tool's result. The after hook
+records what the tool returned and, when the Golem agent withholds it, hands
+the model the agent's notice instead. The hooks also record each model call's
+token usage from CrewAI's ``LLMCallCompletedEvent``.
 
 Usage:
 
-    from crewai import Crew, Agent
+    from crewai import Crew
     from golem_sdk import GolemSDK
-    from golem_sdk.integrations.crewai import (
-        GolemStepListener, GolemTaskListener,
-    )
+    from golem_sdk.integrations.crewai import GolemToolHooks, GolemTaskListener
 
     sdk = GolemSDK(witness_url="http://localhost:39393")
-    listener = GolemStepListener(sdk, agent_id="research-crew")
+    hooks = GolemToolHooks(sdk, agent_id="research-crew", enforce=True).register()
 
-    crew = Crew(
-        agents=[...],
-        tasks=[...],
-        step_callback=listener,           # per-step callback
-        task_callback=GolemTaskListener(sdk, agent_id="research-crew"),
-    )
+    crew = Crew(agents=[...], tasks=[...],
+                task_callback=GolemTaskListener(sdk, agent_id="research-crew"))
+    crew.kickoff()
 
-Because we duck-type the callback payload, this adapter is stable
-across crewai versions that have shuffled the internal Pydantic
-model names (``AgentAction``, ``ToolUsage``, ``StepOutput`` etc.).
-We read attributes if they exist, fall back gracefully, and never
-crash on schema drift.
+CrewAI's hooks are process-wide: once registered they see every crew's tool
+calls until ``hooks.unregister()``. ``with GolemToolHooks(...):`` scopes them
+to a block.
+
+This module imports without ``crewai``; ``register`` needs a crewai that has
+``crewai.hooks`` (tested on 1.15).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+import threading
+import warnings
+from typing import Any, Dict, Optional, Tuple, Union
 
 from golem_sdk import GolemSDK
+from golem_sdk.integrations._calls import ToolCall
+from golem_sdk.policy import blocked_message
 
 logger = logging.getLogger("golem_sdk.integrations.crewai")
 
 
-class GolemStepListener:
-    """Callable for ``Crew(step_callback=...)``.
+class GolemToolHooks:
+    """CrewAI before/after tool-call hooks that record each call and its result,
+    and can refuse the call or withhold the result."""
 
-    Fires once per agent step. Records the step's tool invocation
-    (when present) to Golem as a pre-execution intent. CrewAI uses
-    different shapes across versions for the step payload — we
-    duck-type and pick up whatever's there.
+    def __init__(
+        self,
+        sdk: GolemSDK,
+        agent_id: str,
+        mcp_server_id: str = "crewai",
+        enforce: bool = False,
+        record_usage: bool = True,
+    ) -> None:
+        """Args:
+        sdk: A ``GolemSDK`` instance.
+        agent_id: Identifier for the crew these hooks record.
+        mcp_server_id: The server the calls are judged and recorded under.
+            Defaults to ``"crewai"``.
+        enforce: If True, ask the Golem agent before each tool runs and block
+            the call when policy refuses it. Off by default.
+        record_usage: Record each model call's token counts as CrewAI reports
+            them. Turn off when the model traffic already goes through the
+            Golem agent's proxies, which count it there.
+        """
+        self._sdk = sdk
+        self._agent_id = agent_id
+        self._mcp_server_id = mcp_server_id
+        self._enforce = enforce
+        self._record_usage = record_usage
+        # The before and after hooks get different context objects, so a call
+        # is paired by the thread that runs it, which runs both hooks.
+        self._open: Dict[Tuple[int, str], Union[ToolCall, str]] = {}
+        self._lock = threading.Lock()
+        self._before_hook = self._before
+        self._after_hook = self._after
+        self._usage_handler = self._on_llm_completed
+
+    def register(self) -> "GolemToolHooks":
+        from crewai.events.event_bus import crewai_event_bus
+        from crewai.events.types.llm_events import LLMCallCompletedEvent
+        from crewai.hooks import (
+            register_after_tool_call_hook,
+            register_before_tool_call_hook,
+        )
+
+        register_before_tool_call_hook(self._before_hook)
+        register_after_tool_call_hook(self._after_hook)
+        if self._record_usage:
+            crewai_event_bus.register_handler(LLMCallCompletedEvent, self._usage_handler)
+        return self
+
+    def unregister(self) -> None:
+        from crewai.events.event_bus import crewai_event_bus
+        from crewai.events.types.llm_events import LLMCallCompletedEvent
+        from crewai.hooks import (
+            unregister_after_tool_call_hook,
+            unregister_before_tool_call_hook,
+        )
+
+        unregister_before_tool_call_hook(self._before_hook)
+        unregister_after_tool_call_hook(self._after_hook)
+        if self._record_usage:
+            crewai_event_bus.off(LLMCallCompletedEvent, self._usage_handler)
+
+    def __enter__(self) -> "GolemToolHooks":
+        return self.register()
+
+    def __exit__(self, *exc: Any) -> None:
+        self.unregister()
+
+    def _before(self, context: Any) -> Optional[bool]:
+        name = getattr(context, "tool_name", None) or "unknown"
+        raw = getattr(context, "tool_input", None)
+        args = dict(raw) if isinstance(raw, dict) else ({} if raw is None else {"input": raw})
+        call = ToolCall(self._sdk, self._agent_id, self._mcp_server_id, name, args)
+        key = (threading.get_ident(), name)
+        if self._enforce:
+            decision = call.check()
+            if not decision.allowed:
+                with self._lock:
+                    self._open[key] = decision.reason
+                return False
+        call.record()
+        with self._lock:
+            self._open[key] = call
+        return None
+
+    def _after(self, context: Any) -> Optional[str]:
+        name = getattr(context, "tool_name", None) or "unknown"
+        with self._lock:
+            opened = self._open.pop((threading.get_ident(), name), None)
+        # CrewAI's own text for a blocked call names no reason.
+        if isinstance(opened, str):
+            return blocked_message(opened)
+        if opened is None:
+            return None
+        return opened.finish(getattr(context, "tool_result", None))
+
+    def _on_llm_completed(self, source: Any, event: Any) -> None:
+        usage = getattr(event, "usage", None)
+        model = getattr(event, "model", None)
+        if not isinstance(usage, dict) or not model:
+            return
+        try:
+            self._sdk.record_usage(
+                str(model),
+                input_tokens=usage.get("prompt_tokens") or 0,
+                output_tokens=usage.get("completion_tokens") or 0,
+                cache_read_tokens=usage.get("cached_prompt_tokens") or 0,
+                cache_creation_tokens=usage.get("cache_creation_tokens") or 0,
+                agent_id=self._agent_id,
+            )
+        except Exception as e:  # noqa: BLE001 — never break the crew
+            logger.warning("golem crewai usage handler failed: %s", type(e).__name__)
+
+
+class GolemStepListener:
+    """Deprecated: use ``GolemToolHooks``.
+
+    CrewAI does not call ``step_callback`` for native function calling, its
+    default for a model that supports it, so this records nothing there; on
+    the ReAct path it is called after the tool has already run.
     """
 
     def __init__(
@@ -57,29 +174,20 @@ class GolemStepListener:
         agent_id: str,
         mcp_server_id: str = "crewai",
     ) -> None:
-        """Args:
-        sdk: A ``GolemSDK`` instance.
-        agent_id: Identifier for the crew that owns this listener.
-        mcp_server_id: Conceptual "server" identifier. Defaults to
-            ``"crewai"``; override when a single crew talks to a
-            specific named toolset you want to slice on.
-        """
+        warnings.warn(
+            "GolemStepListener misses CrewAI's native tool calls and records "
+            "after the tool ran; use GolemToolHooks.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._sdk = sdk
         self._agent_id = agent_id
         self._mcp_server_id = mcp_server_id
 
     def __call__(self, step: Any) -> None:
-        """Step-callback entry point. Called by CrewAI per step.
-
-        CrewAI passes either an ``AgentAction`` (tool used) or an
-        ``AgentFinish`` (no tool, final answer). We capture the
-        action case and silently ignore the finish case — final
-        answers don't represent tool intent.
-        """
         try:
             tool_name = _extract_tool_name(step)
             if not tool_name:
-                # No tool invocation in this step — silent skip.
                 return
             args = _extract_tool_args(step)
             self._sdk.intercept_execution(
@@ -97,10 +205,8 @@ class GolemStepListener:
 class GolemTaskListener:
     """Callable for ``Crew(task_callback=...)`` / ``Task(callback=...)``.
 
-    Fires once per task completion. CrewAI passes a ``TaskOutput``
-    (or similar) with a ``raw_output`` / ``raw`` text field. We
-    treat the task itself as a Golem event so a multi-task crew
-    shows up as N records in the timeline.
+    Records one ``crewai.task`` event per completed task, with its description
+    and the length of its output.
     """
 
     def __init__(
@@ -121,9 +227,6 @@ class GolemTaskListener:
             raw = _get_attr(task_output, "raw_output") or _get_attr(
                 task_output, "raw"
             ) or ""
-            # Description goes in tool_arguments to keep tool_name short;
-            # the raw output text is what an investigator wants to read
-            # but it lives in BYOB-bound storage rather than the chain.
             self._sdk.intercept_execution(
                 agent_id=self._agent_id,
                 mcp_server_id=self._mcp_server_id,
@@ -139,17 +242,8 @@ class GolemTaskListener:
             )
 
 
-# ----------------------------------------------------------------------
-# Duck-typed extractors
-# ----------------------------------------------------------------------
-
-
 def _get_attr(obj: Any, name: str, default: Any = None) -> Any:
-    """Safe attribute or dict-key getter. CrewAI sometimes hands us a
-    Pydantic model (attribute access) and sometimes a plain dict
-    (key access) — try both. Avoids a heap of ``hasattr`` /
-    ``isinstance`` branches at each call site.
-    """
+    """Attribute or dict key: CrewAI hands over Pydantic models and plain dicts."""
     if obj is None:
         return default
     val = getattr(obj, name, None)
@@ -161,13 +255,6 @@ def _get_attr(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def _extract_tool_name(step: Any) -> Optional[str]:
-    """Pick the tool name out of a step payload.
-
-    Across crewai versions we've seen:
-      * ``step.tool`` — a string, modern API
-      * ``step.action.tool`` — older AgentAction wrapper
-      * ``step.tool_name`` — alt naming
-    """
     for path in ("tool", "tool_name"):
         v = _get_attr(step, path)
         if isinstance(v, str) and v:
@@ -181,13 +268,6 @@ def _extract_tool_name(step: Any) -> Optional[str]:
 
 
 def _extract_tool_args(step: Any) -> Dict[str, Any]:
-    """Pick the tool input out of a step payload.
-
-    CrewAI shapes seen:
-      * ``step.tool_input`` — dict
-      * ``step.tool_input`` — JSON string
-      * ``step.action.tool_input`` — older wrapper
-    """
     candidates = (
         _get_attr(step, "tool_input"),
         _get_attr(_get_attr(step, "action"), "tool_input"),

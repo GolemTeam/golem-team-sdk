@@ -290,6 +290,20 @@ describe('GolemSDK Witness Mode', () => {
     expect(entry.host_id).toBe('my-laptop');
   });
 
+  it('records every call from one SDK under one session by default', async () => {
+    // Without an id the Golem agent made a new session for every call, so a
+    // run's calls never chained or read as one conversation.
+    const sdk = new GolemSDK({ witnessUrl: `http://127.0.0.1:${mockPort}` });
+    await sdk.interceptExecution(sampleBOM);
+    await sdk.interceptExecution(sampleBOM);
+    await sleep(500);
+
+    expect(requests.length).toBe(2);
+    expect(new Set(requests.map((r) => r.entry.session_id))).toEqual(new Set([sdk.session]));
+    expect(sdk.session).toMatch(/^sdk-[0-9a-f]{20}$/);
+    expect(new GolemSDK({ witnessUrl: `http://127.0.0.1:${mockPort}` }).session).not.toBe(sdk.session);
+  });
+
   it('should not throw when witness is unreachable', async () => {
     const sdk = new GolemSDK({ witnessUrl: 'http://127.0.0.1:1' });
     // Fire-and-forget — should not throw

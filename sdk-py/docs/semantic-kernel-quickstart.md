@@ -1,8 +1,10 @@
 # Wrapping Semantic Kernel with Golem
 
-Capture every plugin function invocation a Semantic Kernel agent makes by registering a Golem filter on the kernel's function-invocation pipeline.
+Record every kernel function a Semantic Kernel agent calls, before it runs, and what it returned; refuse the calls your Golem policy blocks, and keep a result Golem withholds from the model. One filter on the kernel's function-invocation pipeline does it all.
 
 **Time to set up: ~1 minute.**
+
+Tested against `semantic-kernel` 1.36.
 
 ---
 
@@ -12,7 +14,7 @@ Capture every plugin function invocation a Semantic Kernel agent makes by regist
 pip install golem-team-sdk
 ```
 
-No extra needed: the Semantic Kernel adapter has **no hard dependency on the `semantic_kernel` package**. It duck-types the `FunctionInvocationContext`, so it works across SK versions without a version pin.
+No extra needed: the adapter imports `semantic_kernel` only to build a result when it replaces one.
 
 ## Wire up the filter
 
@@ -35,31 +37,29 @@ kernel.add_filter(
 )
 ```
 
-That's it. From here on, every `kernel.invoke(...)` (and every nested plugin call inside it) generates a Golem record before the function runs.
+Semantic Kernel runs the filter around every kernel function: `kernel.invoke(...)`, nested plugin calls, and the functions the model calls through automatic function calling. Each call is recorded with its arguments before the function runs, under the server `semantic-kernel` unless you pass `mcp_server_id=`. After it runs, what it returned (or the error it raised) is recorded against the same call, with how long it took. A streamed invocation's result is not recorded: reading it would consume the stream.
 
-## What gets captured
+## Blocking a call
 
-| Semantic Kernel event | Golem event | Fires |
-|---|---|---|
-| `function_invocation` (any plugin function) | `intercept_execution(tool_name="<plugin>.<function>")` | Once per function call |
+Pass `enforce=True` (off by default). The filter then asks the Golem agent before each function runs, sending the function name, its arguments and the server. A call your policy blocks does not run: its result is `Blocked by Golem policy: <reason>`, which is what `kernel.invoke` returns and what the model reads when it called the function. A Golem agent that cannot be reached lets the call run (fail open).
 
-LLM round trips are **not** captured by this adapter — they're handled at the HTTP layer via the Golem agent's Anthropic / OpenAI proxies, so emitting them here would double-count.
+## A result Golem withholds
 
-Before an event is signed, the SDK removes what this machine's redaction packs name: email addresses, phone and card numbers, keys, tokens and the like. Names and street addresses need a model and are not found by the SDK. See [Redaction before signing](../README.md#redaction-before-signing).
+The Golem agent checks each result for prompt injection as `mcp__semantic-kernel__<plugin>.<function>`. When a rule withholds it, the filter replaces the result with the agent's notice, so neither `kernel.invoke`'s caller nor the model sees the original. A `withhold` needs no `enforce`; it is decided by the rules on the Golem agent.
+
+## Model usage
+
+Not recorded by this adapter. The function-invocation filter does not see the chat-completion calls automatic function calling makes, which is where Semantic Kernel reports token usage. Model traffic through the Golem agent's Anthropic / OpenAI proxies is counted there.
+
+Every call from one `GolemSDK` is recorded under one session (`sdk.session_id`). Before an event is signed, the SDK removes what this machine's redaction packs name: email addresses, phone and card numbers, keys, tokens and the like. Names and street addresses need a model and are not found by the SDK. See [Redaction before signing](../README.md#redaction-before-signing).
 
 ## Tool naming
 
 The Golem `tool_name` is the fully qualified `{plugin_name}.{function_name}` SK uses for addressing — for example, `Weather.get_current` — so you can slice the ledger by plugin in the console. When a function isn't grouped under a plugin, the bare function name is recorded.
 
-## Robustness
-
-The filter accepts both the modern SK context shape (`context.function.name` / `context.function.plugin_name`) and the older flat shape (`context.function_name` / `context.plugin_name`). It also accepts plain dicts in case SK ever changes the wire format.
-
 ## Failure model
 
-Telemetry failures **never** propagate to the kernel pipeline. The filter wraps the SDK call in `try/except` and logs at `WARN`. Critically, `await next(context)` is **always** called even if the Golem record fails — so the user's plugin function runs regardless.
-
-Exceptions raised by the user's plugin (via `next`) are intentionally **not** caught — they surface to the caller normally so kernel-level error handling keeps working.
+Telemetry failures **never** propagate to the kernel pipeline: a failed record is logged at `WARN` and the function runs. Exceptions raised by the function itself are recorded and then re-raised, so kernel-level error handling keeps working. The only things that change a result are a policy block with `enforce=True` and a withheld result.
 
 ## Verifying it works
 
@@ -72,4 +72,4 @@ curl -s -X POST http://localhost:3003/ \
   | python -m json.tool
 ```
 
-You'll see one event per plugin function call.
+You'll see one event per kernel function call.

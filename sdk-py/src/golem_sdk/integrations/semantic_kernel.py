@@ -1,23 +1,13 @@
 """Microsoft Semantic Kernel integration for the Golem SDK.
 
-Semantic Kernel's observability surface is its **filter system**.
-A filter is an async callable that wraps function invocations:
-
-    async def my_filter(context, next):
-        # pre-invocation
-        await next(context)
-        # post-invocation
-
-Filters are registered via ``kernel.add_filter("function_invocation",
-my_filter)``. The framework feeds in a ``FunctionInvocationContext``
-with attributes ``context.function`` (has ``.name`` and
-``.plugin_name``) and ``context.arguments`` (a ``KernelArguments``
-mapping).
-
-This adapter **does not hard-import** ``semantic_kernel``. We
-duck-type the context — read attributes if they exist, fall back
-gracefully. That way the module imports cleanly on a machine
-without semantic-kernel installed.
+``GolemFunctionInvocationFilter`` is a function-invocation filter: Semantic
+Kernel runs it around every kernel function, whether you call
+``kernel.invoke`` or the model calls the function through automatic function
+calling. It records each call, with its arguments, before the function runs and
+its result after. With ``enforce=True`` a call your policy blocks does not run
+and its result is ``"Blocked by Golem policy: <reason>"``; a result the Golem
+agent withholds is replaced by its notice. Either way the replacement is what
+``kernel.invoke`` returns and what the model reads.
 
 Usage:
 
@@ -31,30 +21,27 @@ Usage:
     kernel = Kernel()
     kernel.add_filter(
         "function_invocation",
-        GolemFunctionInvocationFilter(sdk, agent_id="sk-bot"),
+        GolemFunctionInvocationFilter(sdk, agent_id="sk-bot", enforce=True),
     )
+
+This module imports without ``semantic_kernel``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from golem_sdk import GolemSDK
+from golem_sdk.integrations._calls import ToolCall
+from golem_sdk.policy import blocked_message
 
 logger = logging.getLogger("golem_sdk.integrations.semantic_kernel")
 
 
 class GolemFunctionInvocationFilter:
-    """Async callable that conforms to SK's function-invocation filter signature.
-
-    Records a Golem ``intercept_execution`` event before each
-    Semantic Kernel function (a.k.a. "plugin function") runs.
-    The original function is then invoked via ``await next(context)``.
-
-    SK's filter pipeline calls this object's ``__call__`` — there
-    is no ABC to subclass. Filters are pure async callables.
-    """
+    """Async callable with Semantic Kernel's function-invocation filter signature."""
 
     def __init__(
         self,
@@ -66,11 +53,11 @@ class GolemFunctionInvocationFilter:
         """Args:
         sdk: A ``GolemSDK`` instance.
         agent_id: Identifier for the agent that owns this filter.
-        mcp_server_id: Conceptual "server" identifier. Defaults to
-            ``"semantic-kernel"``.
-        enforce: If True, consult the witness before each function and
-            SKIP the pipeline when policy refuses it. Off by default:
-            turning a monitored agent into a gated one is not a default.
+        mcp_server_id: The server the calls are judged and recorded under.
+            Defaults to ``"semantic-kernel"``.
+        enforce: If True, ask the Golem agent before each function runs and
+            answer a refused call with a refusal result instead of running it.
+            Off by default.
         """
         self._sdk = sdk
         self._agent_id = agent_id
@@ -82,60 +69,48 @@ class GolemFunctionInvocationFilter:
         context: Any,
         next: Callable[[Any], Awaitable[None]],
     ) -> None:
-        # The gate is NOT awaiting next, rather than raising. Semantic Kernel
-        # filters are a pipeline: declining to continue it is how this surface
-        # expresses a refusal, and an exception here would surface to the caller
-        # as a kernel fault instead of a policy decision.
-        #
-        # Checked outside the try below for the same reason the LangChain
-        # adapter raises outside its own: that except exists so a Golem fault
-        # never breaks the kernel, and a policy block is not a fault.
+        name = _extract_tool_name(context)
+        if not name:
+            await next(context)
+            return
+        call = ToolCall(self._sdk, self._agent_id, self._mcp_server_id, name,
+                        _extract_arguments(context))
+
+        # The refusal is a result, not an exception: an exception would reach
+        # the caller as a kernel fault, and the model would never read why.
         if self._enforce:
-            name = _extract_tool_name(context)
-            if name:
-                decision = self._sdk.check_execution(
-                    tool_name=name, agent_id=self._agent_id)
-                if not decision.allowed:
-                    logger.warning("golem policy blocked %s; not continuing the pipeline", name)
-                    return
+            decision = await asyncio.to_thread(call.check)
+            if not decision.allowed:
+                logger.warning("golem policy blocked a kernel function; not running it")
+                _set_result(context, blocked_message(decision.reason))
+                return
 
+        await asyncio.to_thread(call.record)
         try:
-            tool_name = _extract_tool_name(context)
-            if tool_name:
-                args = _extract_arguments(context)
-                self._sdk.intercept_execution(
-                    agent_id=self._agent_id,
-                    mcp_server_id=self._mcp_server_id,
-                    tool_name=tool_name,
-                    tool_arguments=args,
-                )
-        except Exception as e:  # noqa: BLE001 — never break the kernel
-            logger.warning(
-                "golem semantic_kernel filter failed: %s",
-                type(e).__name__,
-            )
-        # Always continue the pipeline — telemetry failure must
-        # never short-circuit the user's function call.
-        await next(context)
+            await next(context)
+        except Exception as e:
+            await asyncio.to_thread(call.finish, f"{type(e).__name__}: {e}", True)
+            raise
+        if _get(context, "is_streaming"):
+            return
+        result = _get(context, "result")
+        notice = await asyncio.to_thread(call.finish, getattr(result, "value", result))
+        if notice is not None:
+            _set_result(context, notice)
 
 
-# ----------------------------------------------------------------------
-# Duck-typed extractors
-# ----------------------------------------------------------------------
+def _set_result(context: Any, text: str) -> None:
+    try:
+        from semantic_kernel.functions.function_result import FunctionResult
+
+        context.result = FunctionResult(function=context.function.metadata, value=text)
+    except Exception as e:  # noqa: BLE001 — the function still does not run
+        logger.warning("golem could not set the kernel function's result: %s", type(e).__name__)
 
 
 def _extract_tool_name(context: Any) -> Optional[str]:
-    """Build a fully qualified tool name from the SK context.
-
-    Format: ``{plugin_name}.{function_name}`` when both are
-    present (the canonical SK addressing scheme), else just the
-    function name. Returns ``None`` when neither is available.
-
-    Looks at:
-      * ``context.function.name`` / ``context.function.plugin_name``
-      * ``context.function_name`` / ``context.plugin_name`` (older API)
-      * dict access for both, in case SK ever hands a plain dict
-    """
+    """``{plugin_name}.{function_name}``, the canonical SK address, or just the
+    function name when it has no plugin."""
     if context is None:
         return None
 
@@ -151,14 +126,6 @@ def _extract_tool_name(context: Any) -> Optional[str]:
 
 
 def _extract_arguments(context: Any) -> Dict[str, Any]:
-    """Pull the function arguments out of the SK context.
-
-    ``context.arguments`` is a ``KernelArguments`` — a Mapping
-    subclass. We try a few paths:
-      * ``dict(context.arguments)`` if mapping-like
-      * ``context.arguments`` if already a dict
-      * empty dict if not present
-    """
     if context is None:
         return {}
     args = _get(context, "arguments")
@@ -166,7 +133,6 @@ def _extract_arguments(context: Any) -> Dict[str, Any]:
         return {}
     if isinstance(args, dict):
         return dict(args)
-    # KernelArguments implements Mapping — try dict() conversion.
     try:
         return dict(args)
     except (TypeError, ValueError):
@@ -174,9 +140,7 @@ def _extract_arguments(context: Any) -> Dict[str, Any]:
 
 
 def _get(obj: Any, name: str) -> Any:
-    """Attribute-or-dict-key getter. SK normally hands us a Pydantic
-    model (attribute access); we also accept dicts for forward
-    compatibility and easier testing."""
+    """Attribute or dict key: SK hands over Pydantic models."""
     if obj is None:
         return None
     val = getattr(obj, name, None)

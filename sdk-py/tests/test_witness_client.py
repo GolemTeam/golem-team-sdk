@@ -139,11 +139,11 @@ SAMPLE_ARGS = dict(
 )
 
 
-def _wait_for_request(requests, timeout=2.0):
-    """Poll until the daemon POST thread has recorded a request."""
+def _wait_for_request(requests, timeout=2.0, count=1):
+    """Poll until the daemon POST threads have recorded `count` requests."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if requests:
+        if len(requests) >= count:
             return
         time.sleep(0.01)
 
@@ -275,6 +275,20 @@ class TestWitnessClient:
         entry = requests[0]["entry"]
         assert entry["session_id"] == "sess-123"
         assert entry["host_id"] == "my-laptop"
+
+    def test_calls_share_one_session_by_default(self, mock_witness):
+        # Without an id the Golem agent made a new session for every call, so a
+        # run's calls never chained or read as one conversation.
+        url, requests = mock_witness
+        sdk = GolemSDK(witness_url=url)
+        sdk.intercept_execution(**SAMPLE_ARGS)
+        sdk.intercept_execution(**SAMPLE_ARGS)
+        _wait_for_request(requests, count=2)
+
+        sessions = {r["entry"]["session_id"] for r in requests}
+        assert sessions == {sdk.session_id}
+        assert sdk.session_id.startswith("sdk-")
+        assert GolemSDK(witness_url=url).session_id != sdk.session_id
 
     def test_graceful_on_witness_unavailable(self):
         """SDK should not raise if witness is unreachable."""

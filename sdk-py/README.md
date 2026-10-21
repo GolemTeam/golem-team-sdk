@@ -39,21 +39,23 @@ pip install golem-team-sdk[openai-agents]  # + OpenAI Agents adapter
 pip install golem-team-sdk[dev,all]     # Dev + all backends (for contributors)
 ```
 
-The `crewai`, `llamaindex`, and `semantic-kernel` adapters intentionally have **no extras** — they duck-type the framework's callback payload so the adapter module imports cleanly even when the framework isn't installed. Only frameworks that require a hard import (LangChain's `BaseCallbackHandler`, OpenAI Agents' `TracingProcessor` ABC) ship as extras.
+The `crewai`, `llamaindex`, and `semantic-kernel` adapters intentionally have **no extras** — their modules import cleanly without the framework installed, and import it, if at all, only when you register or wrap something. Only frameworks that require a hard import (LangChain's `BaseCallbackHandler`, OpenAI Agents' `TracingProcessor` ABC) ship as extras.
 
 ## Framework integrations
 
-The `golem_sdk.integrations.*` modules adapt popular agent frameworks to Golem's `intercept_execution` call. Each is one-class, ~200 lines, fail-open (telemetry exceptions never break the user's chain).
+The `golem_sdk.integrations.*` modules adapt popular agent frameworks to Golem's `intercept_execution` call, and those that can refuse a call to `check_execution`. Each is fail-open: telemetry exceptions never break the user's chain.
 
-| Framework | Module | Quickstart |
-|---|---|---|
-| **LangChain** | `golem_sdk.integrations.langchain.GolemCallbackHandler` | [docs/langchain-quickstart.md](docs/langchain-quickstart.md) |
-| **OpenAI Agents SDK** | `golem_sdk.integrations.openai_agents.GolemTraceProcessor` | [docs/openai-agents-quickstart.md](docs/openai-agents-quickstart.md) |
-| **CrewAI** | `golem_sdk.integrations.crewai.GolemStepListener`, `GolemTaskListener` | [docs/crewai-quickstart.md](docs/crewai-quickstart.md) |
-| **LlamaIndex** | `golem_sdk.integrations.llama_index.GolemCallbackHandler` | [docs/llamaindex-quickstart.md](docs/llamaindex-quickstart.md) |
-| **Semantic Kernel** | `golem_sdk.integrations.semantic_kernel.GolemFunctionInvocationFilter` | [docs/semantic-kernel-quickstart.md](docs/semantic-kernel-quickstart.md) |
+| Framework | Use | With `enforce=True`, a blocked call… | Results and usage | Quickstart |
+|---|---|---|---|---|
+| **LangChain** | `GolemToolMiddleware` for `create_agent` agents; `GolemCallbackHandler` for tools and chains | does not run. The middleware hands the model `Blocked by Golem policy: <reason>`; the handler raises `GolemPolicyBlocked` | Each result is recorded against its call; the middleware replaces a withheld one with the notice, the handler can only record it. Model usage from `usage_metadata` | [docs/langchain-quickstart.md](docs/langchain-quickstart.md) |
+| **OpenAI Agents SDK** | `golem_guard_tools(tools, sdk, ...)`, tool input and output guardrails; `GolemRunHooks` for usage; `GolemTraceProcessor` records from traces, after each tool ran, and cannot block | does not run; the model gets `Blocked by Golem policy: <reason>` as the tool's output | Each result is recorded against its call by the output guardrail, which hands the model the notice for a withheld one (the trace processor only records). Model usage via `GolemRunHooks` | [docs/openai-agents-quickstart.md](docs/openai-agents-quickstart.md) |
+| **CrewAI** | `GolemToolHooks`, CrewAI's process-wide before/after tool-call hooks; `GolemTaskListener` for task completions | does not run; the model gets `Blocked by Golem policy: <reason>` as the tool's result | Each result is recorded against its call by the after hook, which hands the model the notice for a withheld one. Model usage from CrewAI's `LLMCallCompletedEvent` | [docs/crewai-quickstart.md](docs/crewai-quickstart.md) |
+| **LlamaIndex** | `golem_guard_tools(tools, sdk, ...)` wraps the tools; `GolemCallbackHandler` records queries | does not run; the tool raises `GolemPolicyBlocked`, whose message an agent hands the model | Each result is recorded against its call, and a withheld one is replaced by the notice. No usage: LlamaIndex reports tokens in no provider-neutral place | [docs/llamaindex-quickstart.md](docs/llamaindex-quickstart.md) |
+| **Semantic Kernel** | `GolemFunctionInvocationFilter`, a function-invocation filter | does not run; its result, which `kernel.invoke` returns and the model reads, is `Blocked by Golem policy: <reason>` | Each result is recorded against its call, and a withheld one is replaced by the notice. No usage: the filter does not see the chat-completion calls that report it | [docs/semantic-kernel-quickstart.md](docs/semantic-kernel-quickstart.md) |
 
-All adapters share a few invariants, enforced in code: tool arguments are bounded (each string value capped at 64 KB, dict capped at 100 keys) before reaching the SDK, telemetry exceptions are logged at WARN and swallowed, and no adapter logs sensitive payload contents.
+All adapters share a few invariants: telemetry exceptions are logged at WARN and swallowed, and no adapter logs sensitive payload contents.
+
+`intercept_execution` bounds the tool arguments it signs rather than dropping the call: each string is cut at 64 KB and all of them together at 1 MB (a cut string ends in `...[truncated]`), a dict over 100 keys keeps its first 99 plus `_golem_truncated_keys` with the count dropped, a list keeps 1,000 items, nesting stops at 16 levels, and a value CBOR cannot encode (an object, bytes, a set) is recorded as its text. Strings are cut after redaction, so a cut never splits a secret the redaction would have found.
 
 ### Blocking a tool call before it runs
 
@@ -61,25 +63,28 @@ Recording is fire-and-forget; enforcement is not. When the SDK talks to the Gole
 (`GolemSDK(witness_url=...)`), `WitnessClient.check_execution(tool_name, ...)` asks
 the Golem agent on this machine synchronously whether a call may run, through the same CEL rules
 and guard profile the MCP interceptor and the Claude Code hook evaluate. It returns a
-`PolicyDecision` whose action is `allow`, `alert` or `block` (a synchronous call
+`PolicyDecision` whose action is `none` (no rule matched), `allow`, `alert` or `block`, with `allowed` false only for `block` (a synchronous call
 cannot hold a human gate, so a `gate` rule comes back as `block`), and it **fails open**: a Golem agent that cannot
 be reached lets the call proceed and logs why, because a Golem outage must not take a
 customer's agent down.
 
-Two adapters wire it in behind an `enforce` flag that is **off by default**, so
-adding Golem never changes an agent's behaviour until you ask it to:
+The adapters that can refuse a call wire it in behind an `enforce` flag that is
+**off by default**, so adding Golem never changes an agent's behaviour until you ask
+it to. They send the call's arguments and their server (`mcp_server_id`, the
+framework's name unless you set it), and the table above says what the caller sees
+when a call is blocked:
 
 ```python
-from golem_sdk.integrations.langchain import GolemCallbackHandler
-from golem_sdk.policy import GolemPolicyBlocked
+from golem_sdk.integrations.langchain import GolemToolMiddleware
 
-handler = GolemCallbackHandler(sdk, enforce=True)
-# A blocked call raises GolemPolicyBlocked(tool_name, reason) before the tool runs.
+agent = create_agent(model, tools, middleware=[
+    GolemToolMiddleware(sdk, agent_id="support-bot", enforce=True),
+])
+# A blocked call does not run; the model reads "Blocked by Golem policy: <reason>".
 ```
 
-`GolemFunctionInvocationFilter(sdk, enforce=True)` does the same for Semantic
-Kernel, by not invoking the next filter. The CrewAI, LlamaIndex and OpenAI Agents
-adapters record only; call `check_execution` yourself if you need them to refuse.
+Outside the adapters, call `sdk.check_execution(tool_name, tool_arguments=...,
+mcp_server_id=...)` yourself before a call you need to be able to refuse.
 
 Which rules block is decided in the console, not in your code: a rule authored by a
 person blocks when its action is `block`; a rule the defender harness proposed blocks
@@ -90,7 +95,12 @@ human approved it.
 
 The recommended setup sends events to the Golem agent: `GolemSDK(witness_url="http://localhost:39393")`
 signs with COSE_Sign1 and hands the entry to the local Golem agent, which owns BYOB
-storage, and `intercept_execution` returns `bom_hash`, `cose_payload` and
+storage. The agent checks that signature, then signs the ledger entry with the
+machine's key: the entry's `payload_hash` is the SDK's `bom_hash`, the signed bytes go
+to your storage, and the SDK's own signature stays on the entry as `sdk_cose_sign1`.
+Every call from one `GolemSDK` is recorded under one session (`sdk.session_id`);
+pass `session_id=` to group a run under an id of your own.
+`intercept_execution` returns `bom_hash`, `cose_payload` and
 `cbor_payload`. The example below is the deprecated legacy mode, in which the SDK
 stores the payload itself:
 
@@ -115,6 +125,36 @@ print(result['bom_hash'])      # SHA-256 hex (64 chars)
 print(result['storage_uri'])   # s3://my-bucket/boms/<hash>.json
 print(result['signature'])     # ECDSA signature (bytes)
 ```
+
+## Results and model usage
+
+A call is half the story. With the Golem agent, record what the tool returned and
+what each model call used:
+
+```python
+sdk = GolemSDK(witness_url="http://localhost:39393")
+
+call = sdk.intercept_execution("support-bot", "jira", "get_ticket", {"id": "OPS-12"})
+output = get_ticket("OPS-12")
+verdict = sdk.record_result("get_ticket", output, tool_use_id=call["tool_use_id"],
+                            agent_id="support-bot", mcp_server_id="jira")
+reply = verdict.notice if verdict.withheld else output   # what the model reads
+
+sdk.record_usage("claude-sonnet-5-5", input_tokens=1200, output_tokens=85, provider="anthropic")
+```
+
+- `record_result` pairs the result with its call on `tool_use_id`, so the console
+  shows them as one step. It waits for the answer, because the Golem agent checks the
+  result for prompt injection as `mcp__<mcp_server_id>__<tool_name>`, the name the
+  inventory gives the tool. When a rule blocks on that check, `withheld` is true and
+  `notice` is the text to give the model instead. When a rule advises, `advice` is
+  the text to give it alongside the result. It fails open: an unreachable agent
+  answers allow, with `reachable=False`.
+- `record_usage` sends one model call's tokens in the background. They count in
+  the token views. Golem does not price a model an SDK names.
+
+The [framework integrations](#framework-integrations) make both calls for you, where
+the framework exposes what they need.
 
 ## Storage Backends
 
@@ -157,7 +197,7 @@ golem-evidence audit-report --from 1 --to 100 --output report.json
 | `src/golem_sdk/storage.py` | `StorageBackend` ABC + 4 implementations with path traversal protection |
 | `src/golem_sdk/witness_client.py` | `WitnessClient`: witness-mode delivery, the synchronous `check_execution`, and the redaction policy fetch |
 | `src/golem_sdk/redaction.py` | Redaction before signing: the recognizers, operators and the cached machine policy |
-| `src/golem_sdk/policy.py` | `GolemPolicyBlocked`, raised by an enforcing adapter |
+| `src/golem_sdk/policy.py` | `GolemPolicyBlocked`, raised by an enforcing adapter, and the refusal text an adapter hands the model |
 | `src/golem_sdk/evidence_cli.py` | CLI with input validation, bounded queries, safe file output |
 | `src/golem_sdk/integrations/` | The framework adapters above |
 | `tests/test_sdk.py` | 25 tests: instantiation, hashing, signing, storage, optional fields |

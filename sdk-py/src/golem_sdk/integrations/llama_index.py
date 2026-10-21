@@ -1,46 +1,45 @@
 """LlamaIndex integration for the Golem SDK.
 
-LlamaIndex's primary observability surface is the
-``BaseCallbackHandler`` ABC in ``llama_index.core.callbacks``.
-A ``CallbackManager`` fans events out to all registered handlers
-via ``on_event_start`` / ``on_event_end``, keyed by a
-``CBEventType`` enum (FUNCTION_CALL, AGENT_STEP, QUERY, LLM, …).
+Two entry points:
 
-We attach as a callback handler and emit a Golem
-``intercept_execution`` record per ``FUNCTION_CALL`` event (the
-tool-invocation boundary) and per ``QUERY`` event (the
-top-level RAG retrieval boundary). LLM events are intentionally
-skipped — they are captured at the HTTP layer by the witness's
-Anthropic / OpenAI proxies, so emitting them here would
-double-count.
+* ``golem_guard_tools(tools, sdk, ...)`` returns the tools wrapped so that each
+  call is recorded, with its arguments, before it runs, and its result after.
+  With ``enforce=True`` a call your policy blocks raises ``GolemPolicyBlocked``
+  instead of running; a LlamaIndex agent hands the exception's message to the
+  model as the tool's output. A result Golem withholds is replaced by its
+  notice. llama-index-core 0.14 no longer emits a ``FUNCTION_CALL`` callback
+  event, so wrapping the tools is the only way to see tool calls.
+* ``GolemCallbackHandler`` records each top-level ``QUERY`` and, on LlamaIndex
+  releases that still emit them, ``FUNCTION_CALL`` events. Use it alongside
+  the wrapped tools only on 0.14 or later, or calls are recorded twice.
 
 Usage:
 
-    from llama_index.core import Settings
-    from llama_index.core.callbacks import CallbackManager
+    from llama_index.core.agent.workflow import FunctionAgent
     from golem_sdk import GolemSDK
-    from golem_sdk.integrations.llama_index import GolemCallbackHandler
+    from golem_sdk.integrations.llama_index import golem_guard_tools
 
     sdk = GolemSDK(witness_url="http://localhost:39393")
-    handler = GolemCallbackHandler(sdk, agent_id="rag-bot")
-    Settings.callback_manager = CallbackManager([handler])
+    agent = FunctionAgent(
+        tools=golem_guard_tools(tools, sdk, agent_id="rag-bot", enforce=True),
+        llm=llm,
+    )
 
-This adapter **does not hard-import** ``llama_index``. The
-LlamaIndex callback manager duck-types its handlers — it
-iterates the registered list and calls ``on_event_start`` /
-``on_event_end`` / ``start_trace`` / ``end_trace`` without an
-``isinstance`` check. So this class conforms to the interface
-by method signature alone, and importing it works on machines
-without ``llama_index`` installed.
+This module imports without ``llama_index``; ``golem_guard_tools`` imports it.
 """
 
 from __future__ import annotations
 
+import asyncio
+import copy
+import functools
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from golem_sdk import GolemSDK
+from golem_sdk.integrations._calls import ToolCall
+from golem_sdk.policy import GolemPolicyBlocked
 
 logger = logging.getLogger("golem_sdk.integrations.llama_index")
 
@@ -255,12 +254,9 @@ def _extract_tool_name(payload: Optional[Dict[str, Any]]) -> Optional[str]:
 def _extract_tool_args(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Pick the tool arguments out of a FUNCTION_CALL payload.
 
-    Shapes seen:
-      * ``payload["function_call"]`` JSON string with
-        ``{"name": "...", "arguments": {...}}`` or
-        ``{"name": "...", "arguments": "<json>"}``
-      * ``payload["function_call"]`` dict with ``"arguments"``
-      * ``payload["arguments"]`` — direct dict
+    LlamaIndex's own agents put the bare arguments JSON in
+    ``payload["function_call"]``; a ``{"name", "arguments"}`` wrapper and a
+    direct ``payload["arguments"]`` dict are accepted too.
     """
     if not isinstance(payload, dict):
         return {}
@@ -268,24 +264,16 @@ def _extract_tool_args(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if isinstance(args, dict):
         return args
     fc = payload.get("function_call")
-    if isinstance(fc, dict):
-        a = fc.get("arguments")
+    if isinstance(fc, str):
+        fc = _try_json_dict(fc)
+    if not isinstance(fc, dict):
+        return {}
+    if "arguments" in fc and set(fc) <= {"name", "arguments"}:
+        a = fc["arguments"]
         if isinstance(a, dict):
             return a
-        if isinstance(a, str):
-            return _try_json_dict(a)
-    if isinstance(fc, str):
-        try:
-            decoded = json.loads(fc)
-        except (ValueError, TypeError):
-            return {}
-        if isinstance(decoded, dict):
-            a = decoded.get("arguments")
-            if isinstance(a, dict):
-                return a
-            if isinstance(a, str):
-                return _try_json_dict(a)
-    return {}
+        return _try_json_dict(a) if isinstance(a, str) else {}
+    return fc
 
 
 def _try_json_dict(s: str) -> Dict[str, Any]:
@@ -298,3 +286,119 @@ def _try_json_dict(s: str) -> Dict[str, Any]:
     if isinstance(decoded, dict):
         return decoded
     return {"input": decoded}
+
+
+def golem_guard_tools(
+    tools: List[Any],
+    sdk: GolemSDK,
+    agent_id: str,
+    mcp_server_id: str = "llamaindex",
+    enforce: bool = False,
+) -> List[Any]:
+    """The tools, each wrapped to record its calls and results and, with
+    ``enforce``, to refuse what policy blocks. The originals are left as they are."""
+    return [golem_guard_tool(t, sdk, agent_id, mcp_server_id, enforce) for t in tools]
+
+
+def golem_guard_tool(
+    tool: Any,
+    sdk: GolemSDK,
+    agent_id: str,
+    mcp_server_id: str = "llamaindex",
+    enforce: bool = False,
+) -> Any:
+    from llama_index.core.tools import FunctionTool
+
+    guard = _Guard(sdk, agent_id, mcp_server_id, enforce, tool.metadata.get_name())
+    if isinstance(tool, FunctionTool):
+        # A copy rather than a wrapper: agents inject a workflow Context only
+        # into a FunctionTool, so the guarded tool must stay one.
+        guarded = copy.copy(tool)
+        ctx_param = tool.ctx_param_name if tool.requires_context else None
+        guarded._fn = guard.wrap_sync(tool._fn, ctx_param)
+        guarded._async_fn = guard.wrap_async(tool._async_fn, ctx_param)
+        return guarded
+    return _guarded_tool_class()(tool, guard)
+
+
+class _Guard:
+    def __init__(self, sdk: GolemSDK, agent_id: str, mcp_server_id: str, enforce: bool,
+                 tool_name: str) -> None:
+        self._sdk = sdk
+        self._agent_id = agent_id
+        self._mcp_server_id = mcp_server_id
+        self._enforce = enforce
+        self._tool_name = tool_name
+
+    def start(self, args: tuple, kwargs: Dict[str, Any], ctx_param: Optional[str]) -> ToolCall:
+        arguments = {k: v for k, v in kwargs.items() if k != ctx_param}
+        if args:
+            arguments = {"args": list(args), **arguments}
+        call = ToolCall(self._sdk, self._agent_id, self._mcp_server_id, self._tool_name, arguments)
+        if self._enforce:
+            decision = call.check()
+            if not decision.allowed:
+                raise GolemPolicyBlocked(self._tool_name, decision.reason)
+        call.record()
+        return call
+
+    def wrap_sync(self, fn: Callable[..., Any], ctx_param: Optional[str] = None) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            call = self.start(args, kwargs, ctx_param)
+            try:
+                out = fn(*args, **kwargs)
+            except Exception as e:
+                call.finish(f"{type(e).__name__}: {e}", is_error=True)
+                raise
+            notice = call.finish(out)
+            return out if notice is None else notice
+
+        return guarded
+
+    def wrap_async(self, fn: Callable[..., Any], ctx_param: Optional[str] = None) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        async def guarded(*args: Any, **kwargs: Any) -> Any:
+            call = await asyncio.to_thread(self.start, args, kwargs, ctx_param)
+            try:
+                out = await fn(*args, **kwargs)
+            except Exception as e:
+                await asyncio.to_thread(call.finish, f"{type(e).__name__}: {e}", True)
+                raise
+            notice = await asyncio.to_thread(call.finish, out)
+            return out if notice is None else notice
+
+        return guarded
+
+
+@functools.lru_cache(maxsize=None)
+def _guarded_tool_class() -> type:
+    from llama_index.core.tools import AsyncBaseTool, ToolOutput
+
+    class GolemGuardedTool(AsyncBaseTool):
+        def __init__(self, tool: Any, guard: _Guard) -> None:
+            self._tool = tool
+            self._guard = guard
+
+        @property
+        def metadata(self) -> Any:
+            return self._tool.metadata
+
+        def call(self, *args: Any, **kwargs: Any) -> Any:
+            return self._output(self._guard.wrap_sync(self._tool.__call__)(*args, **kwargs))
+
+        async def acall(self, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(self._tool, AsyncBaseTool):
+                inner = self._tool.acall
+            else:
+                async def inner(*a: Any, **k: Any) -> Any:
+                    return await asyncio.to_thread(self._tool, *a, **k)
+            return self._output(await self._guard.wrap_async(inner)(*args, **kwargs))
+
+        def _output(self, value: Any) -> Any:
+            if isinstance(value, ToolOutput):
+                return value
+            return ToolOutput(content=str(value), tool_name=self.metadata.get_name(),
+                              raw_input={}, raw_output=value)
+
+    return GolemGuardedTool

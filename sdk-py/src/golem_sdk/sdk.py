@@ -1,10 +1,12 @@
 import hashlib
 import logging
 import re
+import secrets
 import warnings
 
 import cbor2
-from typing import Optional, List, Dict, Any, Tuple
+from collections.abc import Mapping
+from typing import Optional, List, Dict, Any, Iterable, Tuple
 
 from golem_sdk.cose_signer import COSESigner
 from golem_sdk.redaction import PolicyCache, counts_metadata
@@ -21,6 +23,98 @@ MAX_STRING_LENGTH = 1024
 MAX_TOOL_ARGS_KEYS = 100
 MAX_CHUNKS = 500
 _SAFE_ID_PATTERN = re.compile(r"^[\w\-.:/]{1,255}$")
+
+MAX_ARG_STRING_CHARS = 64 * 1024
+MAX_ARGS_TOTAL_CHARS = 1024 * 1024
+MAX_ARG_ITEMS = 1000
+MAX_ARG_DEPTH = 16
+MAX_ARG_VALUES = 10_000
+TRUNCATED_KEYS = "_golem_truncated_keys"
+_TRUNCATED = "...[truncated]"
+# Every cut that survives is made after redaction, so a secret straddling it has
+# already been found. This earlier one only bounds the redaction work, and sits
+# far enough past any surviving cut that nothing it splits is kept.
+_PRE_REDACTION_CHARS = 2 * MAX_ARG_STRING_CHARS
+
+
+def _as_text(value: Any) -> str:
+    try:
+        text = str(value)
+    except Exception:
+        text = f"<{type(value).__name__}>"
+    return text[:_PRE_REDACTION_CHARS]
+
+
+def _unique_keys(pairs: Iterable[Tuple[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in pairs:
+        base, i = key, 2
+        while key in out:
+            key = f"{base}#{i}"
+            i += 1
+        out[key] = value
+    return out
+
+
+def _coerce_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Reduce arguments to what canonical CBOR and JSON both encode, within bounds.
+
+    An argument nothing can encode becomes its text, and an oversized one is cut,
+    rather than either costing the ledger the whole call.
+    """
+    left = [MAX_ARG_VALUES]
+
+    def walk(value: Any, depth: int) -> Any:
+        left[0] -= 1
+        if left[0] < 0:
+            return _TRUNCATED
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, float):
+            return float(value)
+        if isinstance(value, str):
+            return value[:_PRE_REDACTION_CHARS]
+        if depth < MAX_ARG_DEPTH and isinstance(value, Mapping):
+            items = list(value.items())
+            kept = items if len(items) <= MAX_TOOL_ARGS_KEYS else items[:MAX_TOOL_ARGS_KEYS - 1]
+            out = _unique_keys(
+                (k[:_PRE_REDACTION_CHARS] if isinstance(k, str) else _as_text(k), walk(v, depth + 1))
+                for k, v in kept
+            )
+            if len(kept) < len(items):
+                out[TRUNCATED_KEYS] = len(items) - len(kept)
+            return out
+        if depth < MAX_ARG_DEPTH and isinstance(value, (list, tuple, set, frozenset)):
+            seq = list(value)
+            out_list = [walk(v, depth + 1) for v in seq[:MAX_ARG_ITEMS]]
+            if len(seq) > MAX_ARG_ITEMS:
+                out_list.append(f"...[{len(seq) - MAX_ARG_ITEMS} more items]")
+            return out_list
+        return _as_text(value)
+
+    return walk(arguments, 0)
+
+
+def _cap_strings(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    left = [MAX_ARGS_TOTAL_CHARS]
+
+    def cap(text: str, n: int) -> str:
+        return text if len(text) <= n else text[:n] + _TRUNCATED
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, str):
+            n = max(0, min(MAX_ARG_STRING_CHARS, left[0]))
+            left[0] -= min(len(value), n)
+            return cap(value, n)
+        if isinstance(value, dict):
+            return _unique_keys((cap(k, MAX_ARG_STRING_CHARS), walk(v)) for k, v in value.items())
+        if isinstance(value, list):
+            return [walk(v) for v in value]
+        return value
+
+    return walk(arguments)
 
 
 def _validate_string_field(name: str, value: str, max_length: int = MAX_STRING_LENGTH) -> None:
@@ -122,7 +216,9 @@ class GolemSDK:
                         labels={"branch": "feat/foo", "env": "dev"},
                     )
         """
-        self._session_id = session_id
+        # Without an id the Golem agent made a new session for every call, so a
+        # run's calls never chained or read as one conversation.
+        self._session_id = session_id or f"sdk-{secrets.token_hex(10)}"
         self._host_id = host_id
         self._labels = _validate_sdk_labels(labels or {})
 
@@ -188,8 +284,14 @@ class GolemSDK:
         agent_id: str = "",
         session_id: str = "",
         host_id: str = "",
+        tool_arguments: Optional[Dict[str, Any]] = None,
+        mcp_server_id: str = "",
     ):
         """Ask the witness whether this call may run. BLOCKS.
+
+        Pass the call's ``tool_arguments`` and ``mcp_server_id`` (the server or
+        framework the tool belongs to): rules and inventory decisions match on
+        them, and without them most have nothing to match.
 
         Returns a ``PolicyDecision``. In non-witness mode there is nothing to
         ask, so the answer is allow with ``reachable=False`` — the same shape a
@@ -204,9 +306,82 @@ class GolemSDK:
             tool_name=tool_name,
             command=command,
             agent_id=agent_id,
-            session_id=session_id,
-            host_id=host_id,
+            session_id=session_id or self._session_id,
+            host_id=host_id or self._host_id,
+            tool_arguments=tool_arguments,
+            mcp_server_id=mcp_server_id,
         )
+
+    def record_result(
+        self,
+        tool_name: str,
+        result: Any,
+        tool_use_id: str = "",
+        agent_id: str = "",
+        mcp_server_id: str = "",
+        tool_arguments: Optional[Dict[str, Any]] = None,
+        is_error: bool = False,
+        duration_ms: int = 0,
+    ):
+        """Record what a tool returned, and learn whether the model should read it. BLOCKS.
+
+        Pass the ``tool_use_id`` ``intercept_execution`` returned so the result
+        pairs with its call. Returns a ``ResultDecision``: when ``withheld``,
+        give the model ``notice`` instead of the result. The result is checked
+        for prompt injection under the tool's inventory name,
+        ``mcp__<mcp_server_id>__<tool_name>``. Fails open.
+        """
+        from golem_sdk.witness_client import _RESULT_ALLOW
+
+        if self._witness is None:
+            return _RESULT_ALLOW
+        body: Dict[str, Any] = {
+            "tool_name": tool_name,
+            "agent_id": agent_id,
+            "mcp_server_id": mcp_server_id,
+            "session_id": self._session_id,
+            "host_id": self._host_id,
+            "tool_use_id": tool_use_id,
+            "result": result,
+            "is_error": bool(is_error),
+            "duration_ms": max(0, int(duration_ms)),
+        }
+        if tool_arguments:
+            body["tool_arguments"] = tool_arguments
+        return self._witness.record_result(body)
+
+    def record_usage(
+        self,
+        model: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        provider: str = "",
+        agent_id: str = "",
+        duration_ms: int = 0,
+    ) -> None:
+        """Record one model call's tokens, in the background. Tokens only:
+        Golem does not price a model an SDK names."""
+        if self._witness is None or not model:
+            return
+        self._witness.record_usage({
+            "model": model,
+            "provider": provider,
+            "agent_id": agent_id,
+            "session_id": self._session_id,
+            "host_id": self._host_id,
+            "input_tokens": max(0, int(input_tokens)),
+            "output_tokens": max(0, int(output_tokens)),
+            "cache_read_tokens": max(0, int(cache_read_tokens)),
+            "cache_creation_tokens": max(0, int(cache_creation_tokens)),
+            "duration_ms": max(0, int(duration_ms)),
+        })
+
+    @property
+    def session_id(self) -> str:
+        """The session every call from this SDK is recorded under."""
+        return self._session_id
 
     def _redact(
         self, bom: Dict[str, Any], labels: Dict[str, str]
@@ -241,6 +416,7 @@ class GolemSDK:
         tool_arguments: Dict[str, Any],
         system_prompt: Optional[str] = None,
         retrieved_chunks: Optional[List[Dict[str, str]]] = None,
+        tool_use_id: str = "",
     ) -> Dict[str, Any]:
         """
         Intercepts an agent's execution intent, hashes the state, signs it,
@@ -248,16 +424,20 @@ class GolemSDK:
 
         In witness mode: COSE_Sign1 signs and POSTs protobuf to the Witness.
         In legacy mode: signs, stores to BYOB, optionally bridges to Ingest.
+
+        The returned ``tool_use_id`` (generated unless one is passed) is what
+        ``record_result`` pairs the call's result on.
         """
         # Input validation
         _validate_id_field("agent_id", agent_id)
         _validate_id_field("mcp_server_id", mcp_server_id)
         _validate_id_field("tool_name", tool_name)
+        tool_use_id = tool_use_id or f"call-{secrets.token_hex(8)}"
+        _validate_id_field("tool_use_id", tool_use_id)
 
         if not isinstance(tool_arguments, dict):
             raise TypeError("tool_arguments must be a dictionary")
-        if len(tool_arguments) > MAX_TOOL_ARGS_KEYS:
-            raise ValueError(f"tool_arguments exceeds maximum of {MAX_TOOL_ARGS_KEYS} keys")
+        tool_arguments = _coerce_arguments(tool_arguments)
 
         if system_prompt is not None:
             _validate_string_field("system_prompt", system_prompt, max_length=100_000)
@@ -285,6 +465,7 @@ class GolemSDK:
         redaction_meta: Dict[str, str] = {}
         if self._mode == "witness":
             bom, labels, redaction_meta = self._redact(bom, labels)
+        bom["tool_arguments"] = _cap_strings(bom["tool_arguments"])
 
         # 1. Serialize deterministic payload (CBOR canonical)
         cbor_payload = cbor2.dumps(bom, canonical=True)
@@ -309,10 +490,11 @@ class GolemSDK:
                 session_id=self._session_id,
                 host_id=self._host_id,
                 labels=labels,
-                metadata=redaction_meta,
+                metadata={**redaction_meta, "tool_use_id": tool_use_id},
             )
 
             return {
+                "tool_use_id": tool_use_id,
                 "bom_hash": bom_hash,
                 "cose_payload": cose_bytes,
                 "cbor_payload": cbor_payload,
@@ -323,6 +505,7 @@ class GolemSDK:
             storage_uri = self.storage.store_raw_payload(bom_hash, bom)
 
             result = {
+                "tool_use_id": tool_use_id,
                 "bom_hash": bom_hash,
                 "storage_uri": storage_uri,
                 "signature": signature,

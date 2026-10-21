@@ -91,3 +91,14 @@ def test_wal_disabled(monkeypatch):
     assert c._buffer is None
     # A failed post with no buffer must not raise.
     c._post(b"x", tool_name="t")
+
+
+def test_unusable_wal_dir_disables_buffering_instead_of_raising(tmp_path, monkeypatch):
+    # A read-only home, a container or a sandbox can refuse the buffer folder.
+    # Recording must never break the program that uses the SDK.
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    monkeypatch.setenv("GOLEM_SDK_WAL_PATH", str(blocker / "sdk-wal"))
+    c = WitnessClient(witness_url="http://127.0.0.1:1")
+    assert c._buffer is None
+    c._post(b"x", tool_name="t")

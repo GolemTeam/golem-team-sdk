@@ -40,19 +40,84 @@ export interface WitnessRecordArgs {
 
 const POST_MAX_TRIES = 3;
 
+/**
+ * One synchronous policy answer. `reachable` is separate from `allowed`:
+ * allowed with reachable false is "nobody said no", not "the policy said yes".
+ */
+export interface PolicyDecision {
+  allowed: boolean;
+  action: string;
+  reason: string;
+  reachable: boolean;
+  ruleName: string;
+}
+
+export interface CheckExecutionArgs {
+  toolName: string;
+  /** The shell line, for a shell tool. */
+  command?: string;
+  agentId?: string;
+  sessionId?: string;
+  hostId?: string;
+  /** The call's arguments: rules match on them. */
+  toolArguments?: Record<string, unknown>;
+  /** The server or framework the tool belongs to: rules and inventory decisions match on it. */
+  mcpServerId?: string;
+}
+
+/**
+ * What to do with a tool's result before the model reads it. `withhold`: hand
+ * the model `notice` instead. `advise`: hand it the result with `advice`
+ * beside it. Unreachable reads as allow.
+ */
+export interface ResultDecision {
+  action: string;
+  advice: string;
+  notice: string;
+  reachable: boolean;
+}
+
+const RESULT_ALLOW: ResultDecision = { action: 'allow', advice: '', notice: '', reachable: false };
+const MAX_RESULT_BYTES = 4 * 1024 * 1024;
+
+function jsonSafe(_key: string, value: unknown): unknown {
+  return typeof value === 'bigint' ? value.toString() : value;
+}
+
+function jsonLength(body: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(body, jsonSafe));
+  } catch {
+    return Infinity;
+  }
+}
+
 export class WitnessClient {
   private readonly endpoint: string;
+  private readonly checkEndpoint: string;
+  private readonly resultEndpoint: string;
+  private readonly usageEndpoint: string;
   private readonly policyEndpoint: string;
   private readonly timeout: number;
   private readonly buffer: SdkBuffer | null;
 
   constructor(witnessUrl: string = 'http://localhost:39393') {
     this.endpoint = witnessUrl.replace(/\/$/, '') + '/api/v1/sdk/tool-use';
+    this.checkEndpoint = witnessUrl.replace(/\/$/, '') + '/api/v1/policy-check';
+    this.resultEndpoint = witnessUrl.replace(/\/$/, '') + '/api/v1/sdk/tool-result';
+    this.usageEndpoint = witnessUrl.replace(/\/$/, '') + '/api/v1/sdk/usage';
     this.policyEndpoint = witnessUrl.replace(/\/$/, '') + '/api/v1/redaction-policy';
     this.timeout = 5000; // ms
 
     const dir = resolveWalDir();
-    this.buffer = dir ? new SdkBuffer(dir) : null;
+    this.buffer = null;
+    if (dir) {
+      try {
+        this.buffer = new SdkBuffer(dir);
+      } catch (e) {
+        console.warn(`[golem-sdk] buffer disabled: cannot use ${dir} (${(e as NodeJS.ErrnoException).code ?? 'error'})`);
+      }
+    }
     if (this.buffer) {
       // Replay any backlog from a previous run, off the caller's path.
       void this.buffer.drain((b) => this.postOnce(b)).catch(() => {});
@@ -136,6 +201,115 @@ export class WitnessClient {
     } else {
       console.warn(`Failed to POST to witness (buffering disabled) for tool=${toolName}`);
     }
+  }
+
+  /**
+   * Ask the Golem agent whether this call may run, before it runs.
+   *
+   * FAILS OPEN, like the Python SDK: an agent that is down, slow or unreachable
+   * answers allowed with reachable false, because a collector outage must not
+   * stop a customer's agent. A caller that wants to fail closed can check
+   * `reachable`.
+   */
+  checkExecution(args: CheckExecutionArgs): Promise<PolicyDecision> {
+    const open: PolicyDecision = { allowed: true, action: 'allow', reason: '', reachable: false, ruleName: '' };
+    const body: Record<string, unknown> = {
+      tool_name: args.toolName,
+      command: args.command ?? '',
+      agent_id: args.agentId ?? '',
+      session_id: args.sessionId ?? '',
+      host_id: args.hostId ?? '',
+    };
+    if (args.toolArguments && Object.keys(args.toolArguments).length > 0) {
+      body.tool_arguments = args.toolArguments;
+    }
+    if (args.mcpServerId) {
+      body.mcp_server_id = args.mcpServerId;
+      body.event_type = 'sdk_tool_call';
+    }
+    return this.postJson(this.checkEndpoint, body, 2000).then((r) => {
+      if (!r) return open;
+      const action = String(r.action || 'allow').toLowerCase();
+      return {
+        allowed: action !== 'block' && action !== 'deny',
+        action,
+        reason: String(r.reason || ''),
+        reachable: true,
+        ruleName: String(r.rule_name || ''),
+      };
+    });
+  }
+
+  /**
+   * Record a tool's result and resolve to what the injection check said. The
+   * caller awaits it, since a verdict after the model read the result is no
+   * use. Fails open.
+   */
+  recordResult(body: Record<string, unknown>): Promise<ResultDecision> {
+    let sized = body;
+    if (jsonLength(body) > MAX_RESULT_BYTES) {
+      sized = { ...body, result: String(body.result).slice(0, MAX_RESULT_BYTES / 2) + '...[truncated]' };
+    }
+    return this.postJson(this.resultEndpoint, sized, this.timeout).then((r) => {
+      if (!r) return { ...RESULT_ALLOW };
+      return {
+        action: String(r.action || 'allow').toLowerCase(),
+        advice: String(r.advice || ''),
+        notice: String(r.notice || ''),
+        reachable: true,
+      };
+    });
+  }
+
+  /** Post one model call's token counts. Fire-and-forget. */
+  recordUsage(body: Record<string, unknown>): void {
+    void this.postJson(this.usageEndpoint, body, this.timeout);
+  }
+
+  /** POST JSON; resolves to the parsed 2xx answer, or null on any failure. Never rejects. */
+  private postJson(endpoint: string, body: Record<string, unknown>, timeoutMs: number): Promise<Record<string, any> | null> {
+    let payload: Buffer;
+    try {
+      payload = Buffer.from(JSON.stringify(body, jsonSafe));
+    } catch {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve) => {
+      const url = new URL(endpoint);
+      const req = http.request(
+        {
+          hostname: url.hostname,
+          port: url.port,
+          path: url.pathname,
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': payload.length },
+          timeout: timeoutMs,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('end', () => {
+            const status = res.statusCode ?? 0;
+            if (status < 200 || status >= 300) {
+              resolve(null);
+              return;
+            }
+            try {
+              resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'));
+            } catch {
+              resolve(null);
+            }
+          });
+        },
+      );
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(null);
+      });
+      req.write(payload);
+      req.end();
+    });
   }
 
   /** One POST attempt, classified: 'ok' | 'permanent' | 'retry'. */

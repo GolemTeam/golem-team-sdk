@@ -1,7 +1,7 @@
 import * as crypto from 'crypto';
 import * as cbor from 'cbor';
 import { StorageBackend, LocalDiskStorage } from './storage';
-import { WitnessClient } from './witness-client';
+import { WitnessClient, PolicyDecision, CheckExecutionArgs, ResultDecision } from './witness-client';
 import { coseSign1 } from './cose';
 import { RedactionPolicyCache, redactValue, countsMetadata } from './redaction';
 
@@ -63,6 +63,34 @@ export interface PreExecutionBOM {
   tool_arguments: Record<string, any>;
 }
 
+export interface RecordResultArgs {
+  toolName: string;
+  /** What the tool returned. Anything JSON can encode. */
+  result: unknown;
+  /** The toolUseId interceptExecution returned, so the result pairs with its call. */
+  toolUseId?: string;
+  agentId?: string;
+  mcpServerId?: string;
+  toolArguments?: Record<string, unknown>;
+  isError?: boolean;
+  durationMs?: number;
+}
+
+export interface RecordUsageArgs {
+  model: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  provider?: string;
+  agentId?: string;
+  durationMs?: number;
+}
+
+function count(n: number | undefined): number {
+  return Number.isFinite(n) && (n as number) > 0 ? Math.floor(n as number) : 0;
+}
+
 export interface GolemSDKOptions {
   /** Golem Witness URL (enables witness mode). Default: undefined (legacy mode). */
   witnessUrl?: string;
@@ -101,8 +129,76 @@ export class GolemSDK {
   private labels: Record<string, string>;
   private redaction: RedactionPolicyCache | null = null;
 
+  /**
+   * Ask the Golem agent whether a call may run, before running it. Pass the
+   * call's toolArguments and mcpServerId: rules and inventory decisions match on
+   * them. Defaults to this SDK's session and host. Without a Golem agent
+   * (legacy mode) the answer is allowed with reachable false.
+   */
+  checkExecution(args: CheckExecutionArgs): Promise<PolicyDecision> {
+    if (!this.witness) {
+      return Promise.resolve({ allowed: true, action: 'allow', reason: '', reachable: false, ruleName: '' });
+    }
+    return this.witness.checkExecution({
+      ...args,
+      sessionId: args.sessionId || this.sessionId,
+      hostId: args.hostId || this.hostId,
+    });
+  }
+
+  /**
+   * Record what a tool returned, and learn whether the model should read it.
+   * When the answer's action is `withhold`, give the model `notice` instead of
+   * the result. The result is checked for prompt injection under the tool's
+   * inventory name, `mcp__<mcpServerId>__<toolName>`. Fails open.
+   */
+  recordResult(args: RecordResultArgs): Promise<ResultDecision> {
+    if (!this.witness) {
+      return Promise.resolve({ action: 'allow', advice: '', notice: '', reachable: false });
+    }
+    const body: Record<string, unknown> = {
+      tool_name: args.toolName,
+      agent_id: args.agentId ?? '',
+      mcp_server_id: args.mcpServerId ?? '',
+      session_id: this.sessionId,
+      host_id: this.hostId,
+      tool_use_id: args.toolUseId ?? '',
+      result: args.result === undefined ? null : args.result,
+      is_error: Boolean(args.isError),
+      duration_ms: count(args.durationMs),
+    };
+    if (args.toolArguments && Object.keys(args.toolArguments).length > 0) {
+      body.tool_arguments = args.toolArguments;
+    }
+    return this.witness.recordResult(body);
+  }
+
+  /** Record one model call's tokens. Fire-and-forget. Golem does not price a model an SDK names. */
+  recordUsage(args: RecordUsageArgs): void {
+    if (!this.witness || !args.model) return;
+    this.witness.recordUsage({
+      model: args.model,
+      provider: args.provider ?? '',
+      agent_id: args.agentId ?? '',
+      session_id: this.sessionId,
+      host_id: this.hostId,
+      input_tokens: count(args.inputTokens),
+      output_tokens: count(args.outputTokens),
+      cache_read_tokens: count(args.cacheReadTokens),
+      cache_creation_tokens: count(args.cacheCreationTokens),
+      duration_ms: count(args.durationMs),
+    });
+  }
+
+  /** The session every call from this SDK is recorded under. */
+  get session(): string {
+    return this.sessionId;
+  }
+
   constructor(options?: GolemSDKOptions) {
-    this.sessionId = options?.sessionId || '';
+    // Without an id the Golem agent made a new session for every call, so a
+    // run's calls never chained or read as one conversation.
+    this.sessionId = options?.sessionId || `sdk-${crypto.randomBytes(10).toString('hex')}`;
     this.hostId = options?.hostId || '';
     this.labels = validateSDKLabels(options?.labels);
 
@@ -187,8 +283,12 @@ export class GolemSDK {
    *
    * In witness mode: signs and POSTs to the Witness (localhost sidecar).
    * In legacy mode: signs, stores to BYOB.
+   *
+   * The returned toolUseId (generated unless one is passed) is what
+   * recordResult pairs the call's result on.
    */
-  async interceptExecution(bom: PreExecutionBOM): Promise<{
+  async interceptExecution(bom: PreExecutionBOM, options?: { toolUseId?: string }): Promise<{
+    toolUseId: string;
     bomHash: string;
     storageUri?: string;
     coseSign1: Buffer;
@@ -198,6 +298,8 @@ export class GolemSDK {
     validateIdField('agent_id', bom.agent_id);
     validateIdField('mcp_server_id', bom.mcp_server_id);
     validateIdField('tool_name', bom.tool_name);
+    const toolUseId = options?.toolUseId || `call-${crypto.randomBytes(8).toString('hex')}`;
+    validateIdField('tool_use_id', toolUseId);
 
     if (typeof bom.tool_arguments !== 'object' || bom.tool_arguments === null || Array.isArray(bom.tool_arguments)) {
       throw new Error('tool_arguments must be a plain object');
@@ -257,10 +359,11 @@ export class GolemSDK {
         session_id: this.sessionId,
         host_id: this.hostId,
         labels: this.labels,
-        metadata: redactionMeta,
+        metadata: { ...redactionMeta, tool_use_id: toolUseId },
       });
 
       return {
+        toolUseId,
         bomHash,
         coseSign1: coseBytes,
         cborPayload,
@@ -270,6 +373,7 @@ export class GolemSDK {
       const storageUri = await this.storage!.storeRawPayload(bomHash, bom);
 
       return {
+        toolUseId,
         bomHash,
         storageUri,
         coseSign1: coseBytes,

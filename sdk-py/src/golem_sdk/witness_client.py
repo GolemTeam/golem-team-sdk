@@ -15,7 +15,7 @@ import os
 import threading
 import urllib.request
 import urllib.error
-from typing import Dict, NamedTuple, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 from golem_sdk.gen.transport_pb import encode_ledger_entry
 from golem_sdk.wal import SDKBuffer
@@ -52,6 +52,28 @@ class PolicyDecision(NamedTuple):
     action: str
     reason: str
     reachable: bool
+    rule_name: str = ""
+
+
+class ResultDecision(NamedTuple):
+    """What to do with a tool's result before the model reads it.
+
+    ``withhold``: hand the model ``notice`` instead of the result. ``advise``:
+    hand it the result with ``advice`` beside it. Unreachable reads as allow.
+    """
+
+    action: str
+    advice: str
+    notice: str
+    reachable: bool
+
+    @property
+    def withheld(self) -> bool:
+        return self.action == "withhold"
+
+
+_RESULT_ALLOW = ResultDecision(action="allow", advice="", notice="", reachable=False)
+MAX_RESULT_BYTES = 4 * 1024 * 1024
 
 
 class WitnessClient:
@@ -71,11 +93,18 @@ class WitnessClient:
         # before every tool call, so a slow witness must cost the caller a
         # moment rather than a multi-second stall on each invocation.
         self._check_timeout = 2  # seconds
+        self._result_endpoint = f"{self.witness_url}/api/v1/sdk/tool-result"
+        self._usage_endpoint = f"{self.witness_url}/api/v1/sdk/usage"
         self._redaction_endpoint = f"{self.witness_url}/api/v1/redaction-policy"
         self._redaction_timeout = 1  # seconds
 
         wal_dir = _resolve_wal_dir()
-        self._buffer = SDKBuffer(wal_dir) if wal_dir else None
+        self._buffer = None
+        if wal_dir:
+            try:
+                self._buffer = SDKBuffer(wal_dir)
+            except OSError as e:
+                logger.warning("SDK buffer disabled: cannot use %s (%s)", wal_dir, type(e).__name__)
         if self._buffer is not None:
             # Replay any backlog left by a previous run, off the caller's thread.
             threading.Thread(target=self._drain_buffer, daemon=True).start()
@@ -128,6 +157,8 @@ class WitnessClient:
         agent_id: str = "",
         session_id: str = "",
         host_id: str = "",
+        tool_arguments: Optional[Dict[str, Any]] = None,
+        mcp_server_id: str = "",
     ) -> "PolicyDecision":
         """Ask the witness whether this call may run. BLOCKS the caller.
 
@@ -145,13 +176,23 @@ class WitnessClient:
         against. ``reachable`` is returned rather than hidden so a caller that
         wants to fail closed can choose to.
         """
-        payload = json.dumps({
+        body = {
             "tool_name": tool_name,
             "command": command,
             "agent_id": agent_id,
             "session_id": session_id,
             "host_id": host_id,
-        }).encode("utf-8")
+        }
+        # Rules match on the arguments and the server, and asset decisions on
+        # the server: without them a check carried nothing to match on.
+        if tool_arguments:
+            body["tool_arguments"] = tool_arguments
+        if mcp_server_id:
+            body["mcp_server_id"] = mcp_server_id
+            body["event_type"] = "sdk_tool_call"
+        # default=str: an argument JSON cannot encode must not raise into the
+        # caller's tool call from outside the fail-open path below.
+        payload = json.dumps(body, default=str).encode("utf-8")
         req = urllib.request.Request(
             self._check_endpoint,
             data=payload,
@@ -173,7 +214,51 @@ class WitnessClient:
             action=action,
             reason=str(body.get("reason") or ""),
             reachable=True,
+            rule_name=str(body.get("rule_name") or ""),
         )
+
+    def record_result(self, body: Dict[str, Any]) -> ResultDecision:
+        """Record a tool's result and return what the injection check said. BLOCKS.
+
+        Synchronous for the same reason as ``check_execution``: a verdict that
+        arrives after the model has read the result is no use. Fails open.
+        """
+        payload = json.dumps(body, default=str).encode("utf-8")
+        if len(payload) > MAX_RESULT_BYTES:
+            body = {**body, "result": str(body.get("result"))[: MAX_RESULT_BYTES // 2] + "...[truncated]"}
+            payload = json.dumps(body, default=str).encode("utf-8")
+        try:
+            answer = self._post_json(self._result_endpoint, payload, self._timeout)
+        except Exception as e:
+            logger.debug("tool result not recorded (%s)", type(e).__name__)
+            return _RESULT_ALLOW
+        action = str(answer.get("action") or "allow").lower()
+        return ResultDecision(
+            action=action,
+            advice=str(answer.get("advice") or ""),
+            notice=str(answer.get("notice") or ""),
+            reachable=True,
+        )
+
+    def record_usage(self, body: Dict[str, Any]) -> None:
+        """Post one model call's token counts in a background thread."""
+        payload = json.dumps(body).encode("utf-8")
+
+        def send() -> None:
+            try:
+                self._post_json(self._usage_endpoint, payload, self._timeout)
+            except Exception as e:
+                logger.debug("model usage not recorded (%s)", type(e).__name__)
+
+        threading.Thread(target=send, daemon=True).start()
+
+    @staticmethod
+    def _post_json(endpoint: str, payload: bytes, timeout: float) -> Dict[str, Any]:
+        req = urllib.request.Request(
+            endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8") or "{}")
 
     def _post(self, body: bytes, tool_name: str = "") -> None:
         """Deliver one entry with a few live retries; buffer to disk on failure."""

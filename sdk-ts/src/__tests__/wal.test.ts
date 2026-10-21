@@ -109,4 +109,22 @@ describe('WitnessClient buffering', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('disables buffering instead of throwing when the folder cannot be made', () => {
+    // A read-only home, a container or a sandbox can refuse the buffer folder.
+    // Recording must never break the program that uses the SDK.
+    const dir = tmpDir();
+    const blocker = path.join(dir, 'a-file');
+    fs.writeFileSync(blocker, '');
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    process.env.GOLEM_SDK_WAL_PATH = path.join(blocker, 'sdk-wal');
+    try {
+      expect(() => new WitnessClient('http://127.0.0.1:1')).not.toThrow();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('buffer disabled'));
+    } finally {
+      warn.mockRestore();
+      process.env.GOLEM_SDK_WAL_PATH = 'off';
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

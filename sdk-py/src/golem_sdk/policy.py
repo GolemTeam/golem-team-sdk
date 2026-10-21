@@ -21,3 +21,7 @@ class GolemPolicyBlocked(Exception):
         self.reason = reason
         detail = f": {reason}" if reason else ""
         super().__init__(f"Golem policy blocked {tool_name}{detail}")
+
+
+def blocked_message(reason: str) -> str:
+    return f"Blocked by Golem policy: {reason}" if reason else "Blocked by Golem policy."

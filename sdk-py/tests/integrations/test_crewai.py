@@ -8,6 +8,8 @@ hands its callbacks.
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from golem_sdk import GolemSDK
 from golem_sdk.integrations.crewai import (
     GolemStepListener,
@@ -15,6 +17,8 @@ from golem_sdk.integrations.crewai import (
     _extract_tool_name,
     _extract_tool_args,
 )
+
+pytestmark = pytest.mark.filterwarnings("ignore:GolemStepListener:DeprecationWarning")
 
 
 # ----------------------------------------------------------------------
@@ -26,6 +30,12 @@ def _mock_sdk():
     sdk = MagicMock(spec=GolemSDK)
     sdk.intercept_execution = MagicMock()
     return sdk
+
+
+@pytest.mark.filterwarnings("default")
+def test_step_listener_is_deprecated():
+    with pytest.warns(DeprecationWarning, match="GolemToolHooks"):
+        GolemStepListener(_mock_sdk(), agent_id="crew-A")
 
 
 class FakeStep:
